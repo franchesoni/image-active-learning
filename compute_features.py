@@ -16,7 +16,7 @@ class InstancesDataset(Dataset):
                 if not parts:
                     continue
                 img_path = parts[0]
-                bbox = tuple(map(int, parts[1:5])) if len(parts) == 5 else None
+                bbox = torch.tensor(list(map(int, parts[1:5]))) if len(parts) == 5 else torch.tensor([-1, -1, -1, -1])
                 self.samples.append({'img_path': img_path, 'bbox': bbox})
     
     def __len__(self):
@@ -31,7 +31,7 @@ class InstancesDataset(Dataset):
         img_tensor = self.transform(img)
         return img_tensor, sample['bbox'], img_path
 
-def main(refs='instance_references_EXAMPLE.txt', out='features.npy', batch_size=16):
+def main(refs='instance_references_EXAMPLE.txt', out='features.npy', batch_size=16, num_workers=8):
     # Stick to DINO
     model_name = 'vit_large_patch14_reg4_dinov2.lvd142m'
     model = timm.create_model(model_name, pretrained=True, num_classes=0)
@@ -44,7 +44,7 @@ def main(refs='instance_references_EXAMPLE.txt', out='features.npy', batch_size=
 
     # Create dataset and dataloader
     dataset = InstancesDataset(refs, transform)
-    dl = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=4)
+    dl = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers)
 
     all_feats, all_paths = [], []
     # Assume patch size from model (default 14 for vit_large_patch14)
