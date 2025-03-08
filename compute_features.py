@@ -1,3 +1,5 @@
+import tqdm
+from pathlib import Path
 import os
 import numpy as np
 import torch
@@ -50,44 +52,46 @@ def main(refs='instance_references_EXAMPLE.txt', out='features.npy', batch_size=
     # Assume patch size from model (default 14 for vit_large_patch14)
     patch_size = getattr(model, 'patch_size', 14)
     input_size = data_config.get('input_size', (3, 224, 224))
-    grid_h, grid_w = input_size[1] // patch_size, input_size[2] // patch_size
+    feat_n_rows, feat_n_cols = input_size[1] // patch_size, input_size[2] // patch_size
 
-    with torch.no_grad():
-        for imgs, bboxes, paths in dl:
-            imgs = imgs.cuda() if torch.cuda.is_available() else imgs
-            feats_out = model.forward_features(imgs)
-            # Expecting dict with 'x_norm_clstoken' and optionally 'x_norm_patchtokens'
-            cls_tokens = feats_out.get('x_norm_clstoken', None) if isinstance(feats_out, dict) else feats_out
-            patch_tokens = feats_out.get('x_norm_patchtokens', None) if isinstance(feats_out, dict) else None
+    if Path(out).exists():
+        os.remove(out)
+    with open(model_name + '_' + out, 'ab') as f:
+        with torch.no_grad():
+            for imgs, bboxes, paths in tqdm.tqdm(dl):
+                imgs = imgs.cuda() if torch.cuda.is_available() else imgs
+                feats_out = model.forward_features(imgs)
+                B, Np5, D = feats_out.shape
+                # Expecting dict with 'x_norm_clsfeat' and optionally 'x_norm_patchfeats'
+                cls_feats = feats_out[:, 0, :]  # (B, D)
+                patch_feats = feats_out[:, 5:].reshape(B, feat_n_rows, feat_n_cols, D)  # (B, fH, fW, D)
 
-            batch_feats = []
-            for i in range(imgs.size(0)):
-                bbox = bboxes[i]
-                if bbox is None or patch_tokens is None:
-                    feat = cls_tokens[i]
-                else:
-                    x1, y1, x2, y2 = bbox
-                    # Map bbox coordinates (assumed in resized image space) to token grid indices
-                    token_x1 = int(x1 / patch_size)
-                    token_y1 = int(y1 / patch_size)
-                    token_x2 = int(np.ceil(x2 / patch_size))
-                    token_y2 = int(np.ceil(y2 / patch_size))
-                    tokens = patch_tokens[i].reshape(grid_h, grid_w, -1)
-                    token_x1 = max(token_x1, 0)
-                    token_y1 = max(token_y1, 0)
-                    token_x2 = min(token_x2, grid_w)
-                    token_y2 = min(token_y2, grid_h)
-                    if token_x2 <= token_x1 or token_y2 <= token_y1:
-                        feat = cls_tokens[i]
+                batch_feats = []
+                for i in range(imgs.size(0)):
+                    bbox = bboxes[i]
+                    if (-1==bbox).any():
+                        feat = cls_feats[i]  # (D,)
                     else:
-                        region = tokens[token_y1:token_y2, token_x1:token_x2, :]
-                        feat = region.mean(dim=(0,1))
-                batch_feats.append(feat.cpu().numpy())
-                all_paths.append(paths[i])
-            all_feats.append(np.stack(batch_feats))
-    all_feats = np.concatenate(all_feats, axis=0) if all_feats else np.array([])
-    np.save(out, all_feats)
-    print(f"Saved features to {out}, shape={all_feats.shape}")
+                        r1, c1, r2, c2 = bbox
+                        # Map bbox coordinates (assumed in resized image space) to feat grid indices
+                        feat_r1 = int(r1 / patch_size)
+                        feat_c1 = int(c1 / patch_size)
+                        feat_r2 = int(np.ceil(r2 / patch_size))
+                        feat_c2 = int(np.ceil(c2 / patch_size))
+                        feats = patch_feats[i]  # (fH, fW, D)
+                        feat_r1 = max(feat_r1, 0)
+                        feat_c1 = max(feat_c1, 0)
+                        feat_r2 = min(feat_r2, feat_n_rows)
+                        feat_c2 = min(feat_c2, feat_n_cols)
+                        if feat_r2 <= feat_r1 or feat_c2 <= feat_c1:
+                            feat = cls_feats[i]
+                        else:
+                            region = feats[feat_c1:feat_c2, feat_r1:feat_r2, :]
+                            feat = region.mean(dim=(0,1))
+                    batch_feats.append(feat)
+                    all_paths.append(paths[i])
+                batch_feats = torch.stack(batch_feats).cpu().numpy()
+                batch_feats.tofile(f)
 
 if __name__ == '__main__':
     fire.Fire(main)
