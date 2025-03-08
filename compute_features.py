@@ -54,9 +54,10 @@ def main(refs='instance_references_EXAMPLE.txt', out='features.npy', batch_size=
     input_size = data_config.get('input_size', (3, 224, 224))
     feat_n_rows, feat_n_cols = input_size[1] // patch_size, input_size[2] // patch_size
 
-    if Path(out).exists():
-        os.remove(out)
-    with open(model_name + '_' + out, 'ab') as f:
+    tmppath = Path('tmp.npy')
+    if tmppath.exists():
+        os.remove(tmppath)
+    with open(tmppath, 'ab') as f:
         with torch.no_grad():
             for imgs, bboxes, paths in tqdm.tqdm(dl):
                 imgs = imgs.cuda() if torch.cuda.is_available() else imgs
@@ -90,8 +91,11 @@ def main(refs='instance_references_EXAMPLE.txt', out='features.npy', batch_size=
                             feat = region.mean(dim=(0,1))
                     batch_feats.append(feat)
                     all_paths.append(paths[i])
-                batch_feats = torch.stack(batch_feats).cpu().numpy()
+                batch_feats = torch.stack(batch_feats).float().cpu().numpy()
                 batch_feats.tofile(f)
+    feats = np.fromfile(tmppath, dtype=np.float32).reshape(-1, D)
+    np.save(out, feats)
+    os.remove(tmppath)
 
 if __name__ == '__main__':
     fire.Fire(main)
