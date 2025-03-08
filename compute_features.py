@@ -33,7 +33,7 @@ class InstancesDataset(Dataset):
 
 def main(refs='instance_references_EXAMPLE.txt', out='features.npy', batch_size=16, num_workers=8):
     # Stick to DINO
-    model_name = 'vit_large_patch14_reg4_dinov2.lvd142m'
+    model_name = 'vit_small_patch14_reg4_dinov2.lvd142m'
     model = timm.create_model(model_name, pretrained=True, num_classes=0)
     model.eval()
     model = model.cuda() if torch.cuda.is_available() else model
