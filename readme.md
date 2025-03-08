@@ -19,9 +19,7 @@ We propose two methods to choose the most informative samples to be annotated:
 - Object detection: say yes/no for each bounding box
 
 ## Requirements
-You just need:
-- a list of (img_path,) OR
-- a list of (img_path, bounding_box) 
+You just need a list of (img_path) OR (img_path tl_row tl_col br_row br_col)
 
 just like in the `instance_references_EXAMPLE.txt`.
 
@@ -31,9 +29,9 @@ and of course, clone the repo and `pip install -r requirements.txt`.
 
 The features are really important. We recommend using DINOv2reg or SigLIP2. To compute them run one of the following:
 - `python compute_features.py --refs='instance_references_EXAMPLE.txt' --img --dino`
-- `python compute_features.py --refs='instance_references_EXAMPLE.txt'--img --siglip`
-- `python compute_features.py --refs='instance_references_EXAMPLE.txt'--bbox --dino`
-- `python compute_features.py --refs='instance_references_EXAMPLE.txt'--bbox --siglip`
+- `python compute_features.py --refs='instance_references_EXAMPLE.txt' --img --siglip`
+- `python compute_features.py --refs='instance_references_EXAMPLE.txt' --bbox --dino`
+- `python compute_features.py --refs='instance_references_EXAMPLE.txt' --bbox --siglip`
 
 ### Annotate
 You can configure the `load_image` function in `app.py`, but it should work out of the box. To launch the webapp run: 
