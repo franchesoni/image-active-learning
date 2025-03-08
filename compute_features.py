@@ -102,7 +102,7 @@ def main(
                         if feat_r2 <= feat_r1 or feat_c2 <= feat_c1:
                             feat = cls_feats[i]
                         else:
-                            region = feats[feat_c1:feat_c2, feat_r1:feat_r2, :]
+                            region = feats[feat_r1:feat_r2, feat_c1:feat_c2, :]
                             feat = region.mean(dim=(0, 1))
                     batch_feats.append(feat)
                     all_paths.append(paths[i])
