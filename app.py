@@ -1,5 +1,8 @@
 import csv
 import io
+import time
+import uuid
+import asyncio
 from pathlib import Path
 import numpy as np
 from PIL import Image, ImageDraw
@@ -10,11 +13,16 @@ from starlette.applications import Starlette
 from starlette.responses import HTMLResponse, RedirectResponse, Response
 from starlette.routing import Route
 import base64
+from concurrent.futures import ThreadPoolExecutor
+
+# Create a thread pool for background tasks
+executor = ThreadPoolExecutor(max_workers=2)
 
 # Configs
 REFS_FILE = "instance_references_EXAMPLE.txt"
 FEATURES_FILE = "features.npy"
 ANNOTATIONS_FILE = "annotations.csv"
+MODEL_CHECKPOINT = "model_checkpoint.pt"
 
 
 class DataManager:
@@ -34,27 +42,49 @@ class DataManager:
         assert self.N == self.feats.shape[0]
         self.labeled_indices = set()
         self.unlabeled_indices = set(range(self.N))
+        # Add image caching
+        self.image_cache = {}
+        self.cache_size = 20  # Maximum number of images to keep in memory
 
     def get_features(self, idx):
         return self.feats[idx]
 
     def get_image(self, idx, center_crop=False):
-        sample = self.samples[idx]
-        img = Image.open(sample["img_path"]).convert("RGB")
-        if sample["bbox"]:
-            draw = ImageDraw.Draw(img)
-            r1, c1, r2, c2 = sample["bbox"]
-            draw.rectangle([c1, r1, c2, r2], outline="green", width=3)
-            if center_crop:
-                cm, rm = (c1 + c2) // 2, (r1 + r2) // 2
-                left = max(cm - 256, 0)
-                upper = max(rm - 256, 0)
-                img = img.crop((left, upper, left + 512, upper + 512))
+        cache_key = f"{idx}_{center_crop}"
+        if cache_key in self.image_cache:
+            return self.image_cache[cache_key]
+
+        try:
+            sample = self.samples[idx]
+            img = Image.open(sample["img_path"]).convert("RGB")
+            if sample["bbox"]:
+                draw = ImageDraw.Draw(img)
+                r1, c1, r2, c2 = sample["bbox"]
+                draw.rectangle([c1, r1, c2, r2], outline="green", width=3)
+                if center_crop:
+                    cm, rm = (c1 + c2) // 2, (r1 + r2) // 2
+                    left = max(cm - 256, 0)
+                    upper = max(rm - 256, 0)
+                    img = img.crop((left, upper, left + 512, upper + 512))
+                else:
+                    img = img.resize((512, 512))
             else:
                 img = img.resize((512, 512))
-        else:
-            img = img.resize((512, 512))
-        return img
+
+            # Cache the result
+            if len(self.image_cache) >= self.cache_size:
+                # Remove oldest item if cache is full
+                self.image_cache.pop(next(iter(self.image_cache)))
+            self.image_cache[cache_key] = img
+
+            return img
+        except (FileNotFoundError, IOError, OSError) as e:
+            print(f"Error loading image {idx}: {e}")
+            # Create a blank image with error text
+            img = Image.new("RGB", (512, 512), color=(240, 240, 240))
+            draw = ImageDraw.Draw(img)
+            draw.text((100, 240), f"Error loading image {idx}", fill=(255, 0, 0))
+            return img
 
     def mark_labeled(self, idx):
         self.labeled_indices.add(idx)
@@ -78,7 +108,7 @@ class PyTorchLogisticRegression(nn.Module):
 
 
 class IncrementalModel:
-    def __init__(self, n_features, n_iter=10):
+    def __init__(self, n_features, n_iter=10, use_ckpt=False):
         self.n_features = n_features
         self.n_iter = n_iter
         self.model = PyTorchLogisticRegression(n_features)
@@ -86,6 +116,36 @@ class IncrementalModel:
         self.loss_fn = nn.BCELoss()
         self.annotated_feats = []
         self.annotated_labels = []
+        self.use_ckpt = use_ckpt
+
+        if use_ckpt:
+            # Try to load existing model if available
+            self._try_load_checkpoint()
+
+    def _try_load_checkpoint(self):
+        try:
+            checkpoint_path = Path(MODEL_CHECKPOINT)
+            if checkpoint_path.exists():
+                checkpoint = torch.load(checkpoint_path)
+                self.model.load_state_dict(checkpoint["model_state_dict"])
+                self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+                print("Loaded model checkpoint")
+        except Exception as e:
+            print(f"Could not load model checkpoint: {e}")
+
+    def save_checkpoint(self):
+        try:
+            checkpoint_path = Path(MODEL_CHECKPOINT)
+            torch.save(
+                {
+                    "model_state_dict": self.model.state_dict(),
+                    "optimizer_state_dict": self.optimizer.state_dict(),
+                },
+                checkpoint_path,
+            )
+            print(f"Model checkpoint saved at {time.strftime('%H:%M:%S')}")
+        except Exception as e:
+            print(f"Failed to save model: {e}")
 
     def add_annotation(self, feat, label):
         self.annotated_feats.append(feat)
@@ -111,6 +171,10 @@ class IncrementalModel:
             self.optimizer.step()
             print("Loss:", loss.item(), end="\r")
 
+        # Save the model after training
+        if self.use_ckpt:
+            self.save_checkpoint()
+
     def predict_proba(self, X):
         if not self.annotated_feats:
             return np.ones((len(X), 2)) * 0.5
@@ -127,6 +191,7 @@ class Orchestrator:
         refs_file,
         annotation_file,
         score_interval=8,
+        retrain_interval=4,
         n_iter=10,
         sample_cost="certainty",
     ):
@@ -143,6 +208,25 @@ class Orchestrator:
         self.positive_count = 0
         self.negative_count = 0
         self.score_interval = score_interval
+
+        # Add tracking for skipped samples
+        self.skipped_indices = set()
+        self.is_review_mode = False
+        self.current_review_index = 0
+        self.review_indices = []
+
+        # Batch processing
+        self.retrain_interval = retrain_interval  # Update model every N annotations
+        self.annotations_since_update = 0
+
+        # Prevent duplicate submissions
+        self.last_processed_request = None
+        self.last_processed_time = 0
+        self.processing_lock = False
+        self.last_save_timestamp = time.time()
+        self.save_interval = 300  # 5 minutes
+
+        # Initialize candidates
         self.candidates = np.random.choice(
             self.data_mgr.N, score_interval, replace=False
         ).tolist()
@@ -154,11 +238,21 @@ class Orchestrator:
 
     def _load_annotations_and_retrain(self):
         loaded = []
+        self.positive_count = 0
+        self.negative_count = 0
         with open(self.annotation_file, "r") as f:
             reader = csv.reader(f)
             for row in reader:
-                idx, label = int(row[0]), int(row[1])
-                loaded.append((idx, label))
+                try:
+                    idx, label = int(row[0]), int(row[1])
+                    loaded.append((idx, label))
+                    # Update counters
+                    if label == 1:
+                        self.positive_count += 1
+                    else:
+                        self.negative_count += 1
+                except (ValueError, IndexError) as e:
+                    print(f"Error loading annotation row: {e}")
         self.retrain(loaded)
 
     def retrain(self, annotations):
@@ -179,25 +273,155 @@ class Orchestrator:
     def get_next_sample_index(self):
         return self.next_sample
 
-    def handle_annotation(self, idx, label):
-        with open(self.annotation_file, "a", newline="") as f:
-            csv.writer(f).writerow([idx, label])
-        if label == 1:
-            self.positive_count += 1
-        else:
-            self.negative_count += 1
-        feat = self.data_mgr.get_features(idx)
-        self.model.add_annotation(feat, label)
-        self.model.fit()
-        self.data_mgr.mark_labeled(idx)
-        self.annotations.append((idx, label))
-        self.previous_samples.append(self.current_sample)
-        self._pick_next_sample()
+    def handle_annotation(self, idx, label, request_id=None):
+        # Prevent duplicate submissions with same index in quick succession
+        current_time = time.time()
+        if (
+            idx == self.last_processed_request
+            and current_time - self.last_processed_time
+            < 1.0  # Increased from 0.5 to 1.0 second
+        ):
+            print(f"Ignoring duplicate annotation for idx {idx}")
+            return False, False
 
+        if self.processing_lock:
+            print("Another annotation is being processed, skipping")
+            return False, False
+
+        try:
+            self.processing_lock = True
+
+            # Check if this index is already in ANY annotations (not just recent ones)
+            annotated_indices = [a[0] for a in self.annotations]
+            if idx in annotated_indices:
+                print(f"Index {idx} was already annotated, skipping")
+                return False, False
+
+            # Regular annotation process
+            with open(self.annotation_file, "a", newline="") as f:
+                csv.writer(f).writerow([idx, label])
+
+            if label == 1:
+                self.positive_count += 1
+            else:
+                self.negative_count += 1
+
+            feat = self.data_mgr.get_features(idx)
+            self.model.add_annotation(feat, label)
+
+            # Batched model updates
+            self.annotations_since_update += 1
+            should_fit_model = self.annotations_since_update >= self.retrain_interval
+            if should_fit_model:
+                # self.model.fit()  # labeler should do ythis
+                self.annotations_since_update = 0
+
+            self.data_mgr.mark_labeled(idx)
+            self.annotations.append((idx, label))
+            self.previous_samples.append(self.current_sample)
+
+            # Save model periodically
+            current_time = time.time()
+            if current_time - self.last_save_timestamp > self.save_interval:
+                self.model.save_checkpoint()
+                self.last_save_timestamp = current_time
+
+            self.last_processed_request = idx
+            self.last_processed_time = current_time
+
+            self._pick_next_sample()
+            correct = True
+        except Exception as e:
+            print(f"Error processing annotation: {e}")
+            correct = False
+        finally:
+            self.processing_lock = False
+        return correct, should_fit_model
+
+    async def async_fit_model(self):
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(executor, self.model.fit)
+
+    # Add a new method to skip the current sample
+    def skip_current_sample(self):
+        if self.current_sample is None:
+            return False
+
+        self.skipped_indices.add(self.current_sample)
+        print(f"Skipped sample {self.current_sample}")
+        self._pick_next_sample()
+        return True
+
+    # Add a method to toggle review mode
+    def toggle_review_mode(self):
+        if self.is_review_mode:
+            # Exit review mode
+            self.is_review_mode = False
+            self._pick_next_sample()
+            return "Exited review mode"
+        else:
+            # Enter review mode if we have annotations
+            if not self.annotations:
+                return "No annotations to review"
+
+            self.is_review_mode = True
+            self.review_indices = [idx for idx, _ in self.annotations]
+            self.current_review_index = 0
+            self.current_sample = self.review_indices[0]
+            return "Entered review mode"
+
+    # Add method to move to next or previous review image
+    def next_review_image(self):
+        if not self.is_review_mode or not self.review_indices:
+            return False
+
+        self.current_review_index = (self.current_review_index + 1) % len(
+            self.review_indices
+        )
+        self.current_sample = self.review_indices[self.current_review_index]
+        return True
+
+    def prev_review_image(self):
+        if not self.is_review_mode or not self.review_indices:
+            return False
+
+        self.current_review_index = (self.current_review_index - 1) % len(
+            self.review_indices
+        )
+        self.current_sample = self.review_indices[self.current_review_index]
+        return True
+
+    # Modify the get_current_sample_index method to indicate mode
+    def get_current_sample_mode(self):
+        if self.current_sample is None:
+            return None, "none"
+
+        mode = "review" if self.is_review_mode else "annotation"
+        return self.current_sample, mode
+
+    # Update _pick_next_sample to consider skipped samples
     def _pick_next_sample(self):
         if not self.candidates:
             self.refill_candidates()
-        self.current_sample = self.candidates.pop(0) if self.candidates else None
+
+        # Try to find a candidate that isn't skipped
+        while self.candidates and self.candidates[0] in self.skipped_indices:
+            self.candidates.pop(0)
+
+        if not self.candidates:
+            # If we've exhausted all candidates including unskipped ones
+            # Check if we have any skipped samples to fall back to
+            if self.skipped_indices:
+                # Show skipped samples
+                self.current_sample = list(self.skipped_indices)[0]
+                self.skipped_indices.remove(self.current_sample)
+                print(f"Showing previously skipped sample {self.current_sample}")
+            else:
+                # No more samples at all
+                self.current_sample = None
+        else:
+            self.current_sample = self.candidates.pop(0)
+
         self._ensure_next_sample()
 
     def _ensure_next_sample(self):
@@ -206,32 +430,68 @@ class Orchestrator:
         self.next_sample = self.candidates[0] if self.candidates else None
 
     def refill_candidates(self):
+        # Get only unlabeled indices
         unlabeled = self.data_mgr.get_unlabeled_indices()
         if not len(unlabeled):
+            print("No more unlabeled samples!")
             return
-        X = self.data_mgr.feats
+
+        # Make sure we're only working with unlabeled samples
+        X = self.data_mgr.feats[unlabeled]
         probs = self.model.predict_proba(X)
+
+        # Calculate cost for each unlabeled sample
         cost = (
             np.abs(probs[:, 1] - 0.5)
             if self.sample_cost == "certainty"
             else probs[:, 0]
         )
-        sorted_idx = np.argsort(cost)
+
+        # Sort by cost (ascending)
+        sorted_indices = np.argsort(cost)
+
+        # Convert back to original indices
+        self.candidates = [unlabeled[i] for i in sorted_indices[: self.score_interval]]
+
+        # Double check that none of these are already labeled
         self.candidates = [
-            i for i in sorted_idx[: self.score_interval * 10].tolist() if i in unlabeled
-        ][: self.score_interval]
+            idx for idx in self.candidates if idx not in self.data_mgr.labeled_indices
+        ]
+
+        if not self.candidates:
+            print(
+                "Warning: Could not find any valid candidates! Selecting random unlabeled samples."
+            )
+            if len(unlabeled) > 0:
+                self.candidates = np.random.choice(
+                    unlabeled, min(self.score_interval, len(unlabeled)), replace=False
+                ).tolist()
+
+        async def async_refill_candidates(self):
+            loop = asyncio.get_event_loop()
+            await loop.run_in_executor(executor, self.refill_candidates)
 
     def revert_last_annotation(self):
         if not self.annotations or not self.previous_samples:
-            return
+            return False
+
         idx, label = self.annotations.pop()
         self.current_sample = self.previous_samples.pop()
+
+        # Update counters properly
+        if label == 1:
+            self.positive_count -= 1
+        else:
+            self.negative_count -= 1
+
         with open(self.annotation_file, "w", newline="") as f:
             writer = csv.writer(f)
             for aidx, albl in self.annotations:
                 writer.writerow([aidx, albl])
+
         self.data_mgr.unmark_labeled(idx)
         self.retrain(self.annotations)
+        return True
 
     def get_probability_for(self, idx):
         X = self.data_mgr.get_features(idx)[np.newaxis, :]
@@ -239,6 +499,7 @@ class Orchestrator:
         return probs[0, 1]
 
 
+print("Starting the orchestrator...")
 orchestrator = Orchestrator(
     refs_file=REFS_FILE,
     annotation_file=ANNOTATIONS_FILE,
@@ -251,43 +512,195 @@ orchestrator = Orchestrator(
 async def homepage(request):
     idx = orchestrator.get_current_sample_index()
     if idx is None:
-        return HTMLResponse("<h1>No more samples!</h1>")
+        total = orchestrator.data_mgr.N
+        labeled = len(orchestrator.data_mgr.labeled_indices)
+        return HTMLResponse(
+            f"""
+        <html>
+          <head>
+            <title>Active Learning Complete</title>
+            <style>
+              body {{ font-family: Arial, sans-serif; max-width: 600px; margin: 40px auto; padding: 20px; }}
+            </style>
+          </head>
+          <body>
+            <h1>All images have been annotated!</h1>
+            <p>You have completed {labeled} annotations out of {total} total images.</p>
+            <p>Positive annotations: {orchestrator.positive_count}</p>
+            <p>Negative annotations: {orchestrator.negative_count}</p>
+            <p>To restart, relaunch the app.</p>
+          </body>
+        </html>
+        """
+        )
+
+    # Generate a unique ID for this request
+    request_id = str(uuid.uuid4())
+
+    # Handle different status messages
+    message_type = request.query_params.get("message", "")
+    status_message = ""
+
+    if message_type == "duplicate":
+        status_message = """
+        <div style="background-color:#fff3cd;color:#856404;padding:10px;margin:10px 0;border-radius:5px;border:1px solid #ffeeba;">
+            This image was already annotated or a duplicate submission was detected. 
+            Here's the next image to annotate.
+        </div>
+        """
+    elif message_type == "success":
+        status_message = """
+        <div style="background-color:#d4edda;color:#155724;padding:10px;margin:10px 0;border-radius:5px;border:1px solid #c3e6cb;">
+            Annotation saved successfully!
+        </div>
+        """
+
     img = orchestrator.data_mgr.get_image(idx, center_crop=True)
     buf = io.BytesIO()
     img.save(buf, format="JPEG")
     img_base64 = "data:image/jpeg;base64," + base64.b64encode(buf.getvalue()).decode(
         "utf-8"
     )
+
     prob = orchestrator.get_probability_for(idx)
     counter_html = f"<p>Annotations: Positive={orchestrator.positive_count}, Negative={orchestrator.negative_count}</p>"
+
+    # Progress bar
+    total_samples = orchestrator.data_mgr.N
+    labeled_count = len(orchestrator.data_mgr.labeled_indices)
+    progress_html = f"""
+    <div style="margin: 10px 0;">
+        <div style="background-color: #eee; width: 100%; height: 20px; border-radius: 10px;">
+            <div style="background-color: #4CAF50; width: {(labeled_count/total_samples)*100}%; height: 20px; border-radius: 10px; text-align: center; line-height: 20px; color: white;">
+                {labeled_count}/{total_samples} ({(labeled_count/total_samples)*100:.1f}%)
+            </div>
+        </div>
+    </div>
+    """
+
     next_idx = orchestrator.get_next_sample_index()
     prefetch_html = (
         f'<img id="prefetch" src="/prefetch?idx={next_idx}" style="display:none;" />'
         if next_idx is not None
         else ""
     )
+    # Enhanced keyboard handler script
+
     script = """
     <script>
+    // Prevent multiple rapid submissions
+    let processingSubmission = false;
+    let lastKeyTime = 0;
+    const THROTTLE_TIME = 500; // ms
+
     document.addEventListener('keydown', function(event) {
-      if(event.key==='a' || event.key==='ArrowLeft') document.getElementById('negButton').click();
-      else if(event.key==='d' || event.key==='ArrowRight') document.getElementById('posButton').click();
-      else if(event.key==='Backspace'){ event.preventDefault(); window.location.href='/revert'; }
+    const now = Date.now();
+    
+    // Skip if we're already processing or if keys are coming too fast
+    if (processingSubmission || (now - lastKeyTime < THROTTLE_TIME)) {
+        event.preventDefault();
+        return;
+    }
+    
+    lastKeyTime = now;
+    
+    if(event.key==='a' || event.key==='ArrowLeft') {
+        processingSubmission = true;
+        document.getElementById('negButton').classList.add('active');
+        // Set value and then submit form rather than clicking button directly
+        document.getElementById('labelValue').value = '0';
+        document.getElementById('labelForm').submit();
+    }
+    else if(event.key==='d' || event.key==='ArrowRight') {
+        processingSubmission = true;
+        document.getElementById('posButton').classList.add('active'); 
+        // Set value and then submit form rather than clicking button directly
+        document.getElementById('labelValue').value = '1';
+        document.getElementById('labelForm').submit();
+    }
+    else if(event.key==='Backspace'){ 
+        event.preventDefault();
+        if (!processingSubmission) {
+        processingSubmission = true;
+        window.location.href='/revert';
+        }
+    }
+    else if(event.key==='h' || event.key==='?') {
+        document.getElementById('helpModal').style.display = 'block';
+    }
+    else if(event.key==='Escape') {
+        document.getElementById('helpModal').style.display = 'none';
+    }
+    });
+
+    // Reset the processing flag when the page has completely loaded
+    window.addEventListener('load', function() {
+    processingSubmission = false;
+    });
+
+    // Add submission control to the form
+    document.addEventListener('DOMContentLoaded', function() {
+    document.getElementById('labelForm').addEventListener('submit', function() {
+        // Disable buttons to prevent double submission
+        document.getElementById('negButton').disabled = true;
+        document.getElementById('posButton').disabled = true;
+        
+        // Show visual feedback
+        document.body.style.opacity = '0.7';
+        document.body.insertAdjacentHTML('beforeend', 
+        '<div id="loading" style="position:fixed;top:0;left:0;width:100%;height:100%;display:flex;justify-content:center;align-items:center;background:rgba(255,255,255,0.5);z-index:1000;">' +
+        '<div style="padding:20px;background:white;border-radius:5px;box-shadow:0 0 10px rgba(0,0,0,0.2);">Processing...</div></div>');
+    });
     });
     </script>
     """
+
+    help_modal = """
+    <div id="helpModal" style="display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.7); z-index: 1000;">
+      <div style="background: white; margin: 100px auto; padding: 20px; width: 60%; border-radius: 10px;">
+        <h2>Keyboard Shortcuts</h2>
+        <ul>
+          <li><strong>A</strong> or <strong>←</strong>: Negative annotation</li>
+          <li><strong>D</strong> or <strong>→</strong>: Positive annotation</li>
+          <li><strong>Backspace</strong>: Revert last annotation</li>
+          <li><strong>H</strong> or <strong>?</strong>: Show/hide help</li>
+          <li><strong>Esc</strong>: Close help</li>
+        </ul>
+        <button onclick="document.getElementById('helpModal').style.display='none'">Close</button>
+      </div>
+    </div>
+    """
+
     html = f"""
     <html>
+      <head>
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>Image Annotation Tool</title>
+        <style>
+          body {{ font-family: Arial, sans-serif; max-width: 800px; margin: 0 auto; padding: 20px; }}
+          button {{ padding: 10px 20px; margin: 5px; font-size: 16px; cursor: pointer; }}
+          button:disabled {{ opacity: 0.5; cursor: not-allowed; }}
+          button.active {{ background-color: #4CAF50; color: white; }}
+          img {{ max-width: 100%; height: auto; border: 1px solid #ddd; }}
+        </style>
+      </head>
       <body>
         <h1>Sample {idx}</h1>
         <p>Predicted Probability: {prob:.3f}</p>
         {counter_html}
+        {progress_html}
+        {status_message}
         <img src="{img_base64}" width="512" height="512"/>
         {prefetch_html}
         <form method="POST" action="/label" id="labelForm">
           <input type="hidden" name="idx" value="{idx}"/>
-          <button name="label" value="0" id="negButton">Negative (a/left)</button>
-          <button name="label" value="1" id="posButton">Positive (d/right)</button>
+          <input type="hidden" name="request_id" value="{request_id}"/>
+          <input type="hidden" name="label" id="labelValue" value=""/>
+          <button type="button" id="negButton" onclick="document.getElementById('labelValue').value='0';this.form.submit()">Negative (a/left)</button>
+          <button type="button" id="posButton" onclick="document.getElementById('labelValue').value='1';this.form.submit()">Positive (d/right)</button>
         </form>
+        <p>Press <strong>H</strong> or <strong>?</strong> for keyboard shortcuts</p>
+        {help_modal}
         {script}
       </body>
     </html>
@@ -296,24 +709,78 @@ async def homepage(request):
 
 
 async def prefetch_handler(request):
-    idx = int(request.query_params["idx"])
-    img = orchestrator.data_mgr.get_image(idx, center_crop=True)
-    buf = io.BytesIO()
-    img.save(buf, format="JPEG")
-    return Response(buf.getvalue(), media_type="image/jpeg")
+    try:
+        idx = int(request.query_params["idx"])
+        img = orchestrator.data_mgr.get_image(idx, center_crop=True)
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG")
+        return Response(buf.getvalue(), media_type="image/jpeg")
+    except Exception as e:
+        print(f"Error in prefetch: {e}")
+        # Return a transparent 1x1 pixel GIF
+        return Response(
+            b"GIF89a\x01\x00\x01\x00\x80\x00\x00\xff\xff\xff\x00\x00\x00!\xf9\x04\x01\x00\x00\x00\x00,\x00\x00\x00\x00\x01\x00\x01\x00\x00\x02\x02D\x01\x00;",
+            media_type="image/gif",
+        )
 
 
 async def label_handler(request):
-    form = await request.form()
-    idx = int(form["idx"])
-    label = int(form["label"])
-    orchestrator.handle_annotation(idx, label)
-    return RedirectResponse("/", status_code=303)
+    try:
+        form = await request.form()
+        idx = int(form["idx"])
+        label = int(form["label"])
+        request_id = form.get("request_id", str(uuid.uuid4()))
+
+        # Validate input
+        if label not in (0, 1):
+            return HTMLResponse("Invalid label value", status_code=400)
+
+        # Process the annotation with duplicate checking
+        success, should_fit_model = orchestrator.handle_annotation(
+            idx, label, request_id
+        )
+
+        # If duplicate or already annotated, force selection of a new sample
+        # before redirecting to homepage
+        if not success:
+            # Force selection of next sample instead of showing the same one again
+            orchestrator._pick_next_sample()
+            return RedirectResponse("/?message=duplicate", status_code=303)
+
+        # Start model fitting in the background if needed
+        if should_fit_model:
+            asyncio.create_task(orchestrator.async_fit_model())
+
+        return RedirectResponse("/?message=success", status_code=303)
+    except Exception as e:
+        import traceback
+
+        traceback.print_exc()
+        return HTMLResponse(f"Error processing annotation: {str(e)}", status_code=500)
 
 
 async def revert_handler(request):
-    orchestrator.revert_last_annotation()
-    return RedirectResponse("/", status_code=303)
+    try:
+        # Apply the same locking mechanism
+        if orchestrator.processing_lock:
+            return HTMLResponse(
+                "Another operation is in progress, please try again", status_code=429
+            )
+
+        orchestrator.processing_lock = True
+        try:
+            success = orchestrator.revert_last_annotation()
+            if not success:
+                return HTMLResponse("Nothing to revert", status_code=400)
+        finally:
+            orchestrator.processing_lock = False
+
+        return RedirectResponse("/", status_code=303)
+    except Exception as e:
+        import traceback
+
+        traceback.print_exc()
+        return HTMLResponse(f"Error reverting annotation: {str(e)}", status_code=500)
 
 
 app = Starlette(
