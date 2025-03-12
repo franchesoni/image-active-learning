@@ -594,43 +594,49 @@ async def homepage(request):
     const THROTTLE_TIME = 500; // ms
 
     document.addEventListener('keydown', function(event) {
-    const now = Date.now();
-    
-    // Skip if we're already processing or if keys are coming too fast
-    if (processingSubmission || (now - lastKeyTime < THROTTLE_TIME)) {
-        event.preventDefault();
-        return;
-    }
-    
-    lastKeyTime = now;
-    
-    if(event.key==='a' || event.key==='ArrowLeft') {
-        processingSubmission = true;
-        document.getElementById('negButton').classList.add('active');
-        // Set value and then submit form rather than clicking button directly
-        document.getElementById('labelValue').value = '0';
-        document.getElementById('labelForm').submit();
-    }
-    else if(event.key==='d' || event.key==='ArrowRight') {
-        processingSubmission = true;
-        document.getElementById('posButton').classList.add('active'); 
-        // Set value and then submit form rather than clicking button directly
-        document.getElementById('labelValue').value = '1';
-        document.getElementById('labelForm').submit();
-    }
-    else if(event.key==='Backspace'){ 
-        event.preventDefault();
-        if (!processingSubmission) {
-        processingSubmission = true;
-        window.location.href='/revert';
+        const now = Date.now();
+        
+        // Skip if we're already processing or if keys are coming too fast
+        if (processingSubmission || (now - lastKeyTime < THROTTLE_TIME)) {
+            event.preventDefault();
+            return;
         }
-    }
-    else if(event.key==='h' || event.key==='?') {
-        document.getElementById('helpModal').style.display = 'block';
-    }
-    else if(event.key==='Escape') {
-        document.getElementById('helpModal').style.display = 'none';
-    }
+        
+        lastKeyTime = now;
+        
+        // Define keyboard actions mapping
+        const actions = {
+            'a': () => submitLabel('0', 'negButton'),
+            'ArrowLeft': () => submitLabel('0', 'negButton'),
+            'd': () => submitLabel('1', 'posButton'),
+            'ArrowRight': () => submitLabel('1', 'posButton'),
+            'Backspace': () => {
+                event.preventDefault();
+                if (!processingSubmission) {
+                    processingSubmission = true;
+                    window.location.href = '/revert';
+                }
+            },
+            'h': () => toggleHelp(true),
+            '?': () => toggleHelp(true),
+            'Escape': () => toggleHelp(false)
+        };
+        
+        // Execute the action if defined for this key
+        if (actions[event.key]) {
+            actions[event.key]();
+        }
+        
+        function submitLabel(value, buttonId) {
+            processingSubmission = true;
+            document.getElementById(buttonId).classList.add('active');
+            document.getElementById('labelValue').value = value;
+            document.getElementById('labelForm').submit();
+        }
+        
+        function toggleHelp(show) {
+            document.getElementById('helpModal').style.display = show ? 'block' : 'none';
+        }
     });
 
     // Reset the processing flag when the page has completely loaded
