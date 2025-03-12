@@ -14,6 +14,8 @@ from starlette.responses import HTMLResponse, RedirectResponse, Response
 from starlette.routing import Route
 import base64
 from concurrent.futures import ThreadPoolExecutor
+import matplotlib.pyplot as plt
+from io import BytesIO
 
 # Create a thread pool for background tasks
 executor = ThreadPoolExecutor(max_workers=2)
@@ -217,6 +219,8 @@ class Orchestrator:
         self.positive_count = 0
         self.negative_count = 0
         self.score_interval = score_interval
+        self.error_history = []
+        self.current_prediction = None
 
         # Add tracking for skipped samples
         self.skipped_indices = set()
@@ -244,6 +248,69 @@ class Orchestrator:
         if self.annotation_file.exists():
             self._load_annotations_and_retrain()
         self._ensure_next_sample()
+
+    def get_error_chart(self):
+        """Generate an error chart as base64 encoded image with dual y-axes"""
+        if not self.error_history or len(self.error_history) < 2:
+            return None
+
+        # Create figure with appropriate size
+        fig, ax1 = plt.subplots(figsize=(10, 5))
+
+        # Extract data - ensure we're working with numpy arrays for operations
+        errors = np.array(self.error_history)
+        indices = np.arange(len(errors))
+
+        # Primary y-axis for Brier score (left)
+        ax1.set_xlabel("Annotation Count")
+        ax1.set_ylabel("Brier Score (lower is better)", color="tab:red")
+        ax1.set_ylim(0, 1)  # Brier score range
+
+        # Plot individual points for Brier score
+        ax1.scatter(
+            indices, errors, alpha=0.5, color="tab:red", s=20, label="Brier Score"
+        )
+
+        # Calculate and plot cumulative average
+        means = np.cumsum(errors) / np.arange(1, len(errors) + 1)
+        ax1.plot(indices, means, "r-", linewidth=2, label="Avg Brier Score")
+        ax1.tick_params(axis="y", labelcolor="tab:red")
+
+        # Create second y-axis for error rate (right)
+        ax2 = ax1.twinx()
+        ax2.set_ylabel("Error Rate", color="tab:blue")
+        ax2.set_ylim(0, 1)  # Error rate range
+
+        # Calculate and plot error rate (points with brier score < 0.25)
+        error_rate = np.cumsum(errors > 0.25) / np.arange(1, len(errors) + 1)
+        print(errors)
+        print(error_rate)
+        ax2.plot(indices, error_rate, "b-", linewidth=2, label="Error Rate")
+        ax2.tick_params(axis="y", labelcolor="tab:blue")
+
+        # Add grid lines for better readability
+        ax1.grid(True, alpha=0.3)
+
+        # Add title
+        plt.title("Model Performance Over Time")
+
+        # Add combined legend
+        lines1, labels1 = ax1.get_legend_handles_labels()
+        lines2, labels2 = ax2.get_legend_handles_labels()
+        ax1.legend(lines1 + lines2, labels1 + labels2, loc="best")
+
+        # Tight layout to optimize spacing
+        fig.tight_layout()
+
+        # Convert plot to base64 image
+        buf = BytesIO()
+        plt.savefig(buf, format="png", dpi=100)
+        plt.close(fig)
+        buf.seek(0)
+        img_png = buf.getvalue()
+        buf.close()
+
+        return base64.b64encode(img_png).decode("utf-8")
 
     def _load_annotations_and_retrain(self):
         loaded = []
@@ -301,6 +368,10 @@ class Orchestrator:
             if idx in {a[0] for a in self.annotations}:
                 print(f"Index {idx} was already annotated, skipping")
                 return False, False
+
+            if self.current_prediction is not None and len(self.annotations) > 0:
+                brier = (self.current_prediction - label) ** 2
+                self.error_history.append(brier)
 
             # Regular annotation process
             with open(self.annotation_file, "a", newline="") as f:
@@ -367,7 +438,6 @@ class Orchestrator:
             # Enter review mode if we have annotations
             if not self.annotations:
                 return "No annotations to review"
-
             self.is_review_mode = True
             self.review_indices = [idx for idx, _ in self.annotations]
             self.current_review_index = 0
@@ -478,6 +548,11 @@ class Orchestrator:
         else:
             self.negative_count -= 1
 
+        # Remove the last error point if it exists
+        if self.error_history and len(self.error_history) > 0:
+            # Just pop the last error, as our error_history now stores scalar values
+            self.error_history.pop()
+
         with open(self.annotation_file, "w", newline="") as f:
             writer = csv.writer(f)
             for aidx, albl in self.annotations:
@@ -490,7 +565,8 @@ class Orchestrator:
     def get_probability_for(self, idx):
         X = self.data_mgr.get_features(idx)[np.newaxis, :]
         probs = self.model.predict_proba(X)
-        return probs[0, 1]
+        self.current_prediction = probs[0, 1]
+        return self.current_prediction
 
 
 print("Starting the orchestrator...")
@@ -671,6 +747,17 @@ async def homepage(request):
     </div>
     """
 
+    error_chart_html = ""
+    error_chart = orchestrator.get_error_chart()
+    if error_chart:
+        error_chart_html = f"""
+        <div style="margin: 20px 0;">
+            <h3>Prediction Error</h3>
+            <img src="data:image/png;base64,{error_chart}" style="max-width:100%; height:auto; border:1px solid #ddd;" alt="Error Chart" />
+            <p><small>Lower values indicate better model performance. The red line shows the average.</small></p>
+        </div>
+        """
+
     html = f"""
     <html>
       <head>
@@ -689,6 +776,7 @@ async def homepage(request):
         <p>Predicted Probability: {prob:.3f}</p>
         {counter_html}
         {progress_html}
+        {error_chart_html}
         {status_message}
         <img src="{img_base64}" width="512" height="512"/>
         {prefetch_html}
