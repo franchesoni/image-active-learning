@@ -57,30 +57,39 @@ class DataManager:
         try:
             sample = self.samples[idx]
             img = Image.open(sample["img_path"]).convert("RGB")
-            if sample["bbox"]:
+            bbox = sample["bbox"]
+
+            # Draw bounding box if available
+            if bbox:
                 draw = ImageDraw.Draw(img)
-                r1, c1, r2, c2 = sample["bbox"]
+                r1, c1, r2, c2 = bbox
                 draw.rectangle([c1, r1, c2, r2], outline="green", width=3)
+
                 if center_crop:
+                    # Center crop around the bounding box
                     cm, rm = (c1 + c2) // 2, (r1 + r2) // 2
-                    left = max(cm - 256, 0)
-                    upper = max(rm - 256, 0)
-                    img = img.crop((left, upper, left + 512, upper + 512))
+                    img = img.crop(
+                        (
+                            max(cm - 256, 0),
+                            max(rm - 256, 0),
+                            max(cm - 256, 0) + 512,
+                            max(rm - 256, 0) + 512,
+                        )
+                    )
                 else:
                     img = img.resize((512, 512))
             else:
                 img = img.resize((512, 512))
 
-            # Cache the result
+            # Manage cache
             if len(self.image_cache) >= self.cache_size:
-                # Remove oldest item if cache is full
                 self.image_cache.pop(next(iter(self.image_cache)))
             self.image_cache[cache_key] = img
 
             return img
-        except (FileNotFoundError, IOError, OSError) as e:
+        except Exception as e:
             print(f"Error loading image {idx}: {e}")
-            # Create a blank image with error text
+            # Create error image
             img = Image.new("RGB", (512, 512), color=(240, 240, 240))
             draw = ImageDraw.Draw(img)
             draw.text((100, 240), f"Error loading image {idx}", fill=(255, 0, 0))
@@ -182,7 +191,7 @@ class IncrementalModel:
         with torch.no_grad():
             X_t = torch.tensor(X, dtype=torch.float32)
             preds = self.model(X_t).numpy().flatten()
-        return np.vstack([1 - preds, preds]).T
+        return np.stack([1 - preds, preds], axis=1)
 
 
 class Orchestrator:
@@ -274,26 +283,22 @@ class Orchestrator:
         return self.next_sample
 
     def handle_annotation(self, idx, label, request_id=None):
-        # Prevent duplicate submissions with same index in quick succession
+        # Prevent duplicate submissions
         current_time = time.time()
         if (
             idx == self.last_processed_request
-            and current_time - self.last_processed_time
-            < 1.0  # Increased from 0.5 to 1.0 second
-        ):
-            print(f"Ignoring duplicate annotation for idx {idx}")
-            return False, False
-
-        if self.processing_lock:
-            print("Another annotation is being processed, skipping")
+            and current_time - self.last_processed_time < 0.5
+        ) or self.processing_lock:
+            print(
+                f"Skipping annotation: {'duplicate request' if idx == self.last_processed_request else 'processing lock active'}"
+            )
             return False, False
 
         try:
             self.processing_lock = True
 
-            # Check if this index is already in ANY annotations (not just recent ones)
-            annotated_indices = [a[0] for a in self.annotations]
-            if idx in annotated_indices:
+            # Check if this index is already annotated
+            if idx in {a[0] for a in self.annotations}:
                 print(f"Index {idx} was already annotated, skipping")
                 return False, False
 
@@ -301,42 +306,41 @@ class Orchestrator:
             with open(self.annotation_file, "a", newline="") as f:
                 csv.writer(f).writerow([idx, label])
 
-            if label == 1:
-                self.positive_count += 1
-            else:
-                self.negative_count += 1
+            # Update counters and model
+            self.positive_count += 1 if label == 1 else 0
+            self.negative_count += 1 if label == 0 else 0
 
             feat = self.data_mgr.get_features(idx)
             self.model.add_annotation(feat, label)
 
-            # Batched model updates
+            # Track annotation and update sample selection
             self.annotations_since_update += 1
             should_fit_model = self.annotations_since_update >= self.retrain_interval
             if should_fit_model:
-                # self.model.fit()  # labeler should do ythis
                 self.annotations_since_update = 0
 
             self.data_mgr.mark_labeled(idx)
             self.annotations.append((idx, label))
             self.previous_samples.append(self.current_sample)
 
-            # Save model periodically
+            # Periodic model saving
             current_time = time.time()
             if current_time - self.last_save_timestamp > self.save_interval:
                 self.model.save_checkpoint()
                 self.last_save_timestamp = current_time
 
+            # Update request tracking
             self.last_processed_request = idx
             self.last_processed_time = current_time
-
             self._pick_next_sample()
-            correct = True
+
+            return True, should_fit_model
+
         except Exception as e:
             print(f"Error processing annotation: {e}")
-            correct = False
+            return False, False
         finally:
             self.processing_lock = False
-        return correct, should_fit_model
 
     async def async_fit_model(self):
         loop = asyncio.get_event_loop()
@@ -404,23 +408,21 @@ class Orchestrator:
         if not self.candidates:
             self.refill_candidates()
 
-        # Try to find a candidate that isn't skipped
+        # Find first non-skipped candidate
         while self.candidates and self.candidates[0] in self.skipped_indices:
             self.candidates.pop(0)
 
-        if not self.candidates:
-            # If we've exhausted all candidates including unskipped ones
-            # Check if we have any skipped samples to fall back to
-            if self.skipped_indices:
-                # Show skipped samples
-                self.current_sample = list(self.skipped_indices)[0]
-                self.skipped_indices.remove(self.current_sample)
-                print(f"Showing previously skipped sample {self.current_sample}")
-            else:
-                # No more samples at all
-                self.current_sample = None
-        else:
+        # Determine next sample
+        if self.candidates:
             self.current_sample = self.candidates.pop(0)
+        elif self.skipped_indices:
+            # Use a skipped sample as fallback
+            next_sample = next(iter(self.skipped_indices))
+            self.current_sample = next_sample
+            self.skipped_indices.remove(next_sample)
+            print(f"Showing previously skipped sample {self.current_sample}")
+        else:
+            self.current_sample = None
 
         self._ensure_next_sample()
 
@@ -430,46 +432,38 @@ class Orchestrator:
         self.next_sample = self.candidates[0] if self.candidates else None
 
     def refill_candidates(self):
-        # Get only unlabeled indices
+        # Get unlabeled indices
         unlabeled = self.data_mgr.get_unlabeled_indices()
-        if not len(unlabeled):
+        if len(unlabeled) == 0:
             print("No more unlabeled samples!")
             return
 
-        # Make sure we're only working with unlabeled samples
+        # Get predictions for unlabeled samples
         X = self.data_mgr.feats[unlabeled]
         probs = self.model.predict_proba(X)
 
-        # Calculate cost for each unlabeled sample
+        # Calculate cost based on strategy
         cost = (
             np.abs(probs[:, 1] - 0.5)
             if self.sample_cost == "certainty"
             else probs[:, 0]
         )
 
-        # Sort by cost (ascending)
-        sorted_indices = np.argsort(cost)
+        # Sort and select candidates
+        sorted_indices = np.argsort(cost)[: self.score_interval]
+        self.candidates = [unlabeled[i] for i in sorted_indices]
 
-        # Convert back to original indices
-        self.candidates = [unlabeled[i] for i in sorted_indices[: self.score_interval]]
-
-        # Double check that none of these are already labeled
+        # Double check candidates are actually unlabeled
         self.candidates = [
-            idx for idx in self.candidates if idx not in self.data_mgr.labeled_indices
+            idx for idx in self.candidates if idx in self.data_mgr.unlabeled_indices
         ]
 
-        if not self.candidates:
-            print(
-                "Warning: Could not find any valid candidates! Selecting random unlabeled samples."
-            )
-            if len(unlabeled) > 0:
-                self.candidates = np.random.choice(
-                    unlabeled, min(self.score_interval, len(unlabeled)), replace=False
-                ).tolist()
-
-        async def async_refill_candidates(self):
-            loop = asyncio.get_event_loop()
-            await loop.run_in_executor(executor, self.refill_candidates)
+        # Fall back to random sampling if needed
+        if not self.candidates and len(unlabeled) > 0:
+            print("Falling back to random sampling")
+            self.candidates = np.random.choice(
+                unlabeled, min(self.score_interval, len(unlabeled)), replace=False
+            ).tolist()
 
     def revert_last_annotation(self):
         if not self.annotations or not self.previous_samples:
