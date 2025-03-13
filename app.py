@@ -776,7 +776,6 @@ async def homepage(request):
         <p>Predicted Probability: {prob:.3f}</p>
         {counter_html}
         {progress_html}
-        {error_chart_html}
         {status_message}
         <img src="{img_base64}" width="512" height="512"/>
         {prefetch_html}
@@ -789,6 +788,7 @@ async def homepage(request):
         </form>
         <p>Press <strong>H</strong> or <strong>?</strong> for keyboard shortcuts</p>
         {help_modal}
+        {error_chart_html}
         {script}
       </body>
     </html>
