@@ -1,0 +1,9 @@
+fire
+numpy
+Pillow
+starlette
+timm
+torch
+uvicorn
+matplotlib
+python-multipart

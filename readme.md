@@ -37,7 +37,12 @@ The tool offers two methods for selecting samples:
 
 - Python 3.7+
 - Required packages: `pip install -r requirements.txt`
-- A list of images paths OR image paths with bounding boxes (see `instance_references_EXAMPLE.txt`)
+- A list of images paths OR image paths with bounding boxes (see `instance_references_EXAMPLE.txt`), e.g.:
+```
+/path/to/image1.jpg
+/path/to/image2.jpg row1 col1 row2 col2  # Optional bounding box coordinates (top-left and bottom-right corners)
+```
+
 
 ## Quick Start
 
