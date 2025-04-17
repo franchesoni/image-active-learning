@@ -61,7 +61,9 @@ class DataManager:
 
         sample = self.samples[idx]
         try:
-            img = self._load_image_with_bbox([sample["img_path"]] + list(sample["bbox"]), center_crop=center_crop)
+            img = self._load_image_with_bbox(
+                [sample["img_path"]] + list(sample["bbox"]), center_crop=center_crop
+            )
             # cache eviction
             if len(self.image_cache) >= self.cache_size:
                 self.image_cache.pop(next(iter(self.image_cache)))
@@ -307,9 +309,7 @@ class IncrementalModel:
         if not self.annotated_feats:
             return
         X = torch.tensor(np.array(self.annotated_feats), dtype=torch.float32)
-        y = torch.tensor(np.array(self.annotated_labels), dtype=torch.long).view(
-            -1
-        )
+        y = torch.tensor(np.array(self.annotated_labels), dtype=torch.long).view(-1)
         self.model.train()
         for _ in range(self.n_iter):
             self.optimizer.zero_grad()
@@ -459,7 +459,7 @@ class Orchestrator:
                     self.class_counts[label] += 1
                 except (ValueError, IndexError) as e:
                     print(f"Error loading annotation row: {e}")
-        
+
         # Use more iterations for initial training if there are enough annotations
         if len(loaded) > 10:
             old_n_iter = self.model.n_iter
@@ -480,6 +480,7 @@ class Orchestrator:
         self.model.set_annotations(feats, labels)
         self.model.fit()
         self.candidates.clear()
+
     def get_current_sample_index(self):
         return self.current_sample
 
@@ -516,7 +517,10 @@ class Orchestrator:
 
             # Regular annotation process
             with open(self.annotation_file, "a", newline="") as f:
-                csv.writer(f).writerow([idx, label, self.data_mgr.samples[idx]["img_path"]] + list(self.data_mgr.samples[idx]["bbox"]))
+                csv.writer(f).writerow(
+                    [idx, label, self.data_mgr.samples[idx]["img_path"]]
+                    + list(self.data_mgr.samples[idx]["bbox"])
+                )
 
             # Update class_counts
             self.class_counts[label] += 1
@@ -647,9 +651,13 @@ class Orchestrator:
         if len(unlabeled) == 0:
             print("No more unlabeled samples!")
             return
-        unlabeled = np.array([
-            idx for idx in unlabeled if self.data_mgr.samples[idx]['img_path'] == str(IMAGE_NUMBER)
-        ])
+        unlabeled = np.array(
+            [
+                idx
+                for idx in unlabeled
+                if self.data_mgr.samples[idx]["img_path"] == str(IMAGE_NUMBER)
+            ]
+        )
 
         # Get predictions for unlabeled samples
         X = self.data_mgr.feats[unlabeled]
@@ -730,7 +738,10 @@ async def homepage(request):
     if idx is None:
         total = orchestrator.data_mgr.N
         labeled = len(orchestrator.data_mgr.labeled_indices)
-        class_list = "".join(f"<li>{c}: {orchestrator.class_counts[i]}</li>" for i, c in enumerate(CLASS_NAMES))
+        class_list = "".join(
+            f"<li>{c}: {orchestrator.class_counts[i]}</li>"
+            for i, c in enumerate(CLASS_NAMES)
+        )
         return HTMLResponse(
             f"""
         <html>
@@ -789,7 +800,13 @@ async def homepage(request):
         prob_table += f"<tr><td>{cname}</td><td>{prob_vec[i]:.3f}</td><td>{class_counts[i]}</td></tr>"
     prob_table += "</table>"
 
-    counter_html = "<p>Counts: " + ", ".join(f"{CLASS_NAMES[i]}={class_counts[i]}" for i in range(len(CLASS_NAMES))) + "</p>"
+    counter_html = (
+        "<p>Counts: "
+        + ", ".join(
+            f"{CLASS_NAMES[i]}={class_counts[i]}" for i in range(len(CLASS_NAMES))
+        )
+        + "</p>"
+    )
 
     # Progress bar
     total_samples = orchestrator.data_mgr.N
