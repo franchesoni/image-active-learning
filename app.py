@@ -24,9 +24,10 @@ executor = ThreadPoolExecutor(max_workers=2)
 IMAGE_NUMBER = 1
 CLASS_NAMES = ["Lymphocyte", "Lymphoplasmocyte", "Plasmocyte", "Other"]
 # CLASS_NAMES = ["Bad quality", "Good quality"] 
-REFS_FILE = "instance_references.txt"
-FEATURES_FILE = "features.npy"
-ANNOTATIONS_FILE = "cell_annotations.csv"
+# REFS_FILE = "instance_references.txt"
+REFS_FILE = "filtered_references_tristan.txt" 
+FEATURES_FILE = "filtered_feats_tristan.npy"
+ANNOTATIONS_FILE = "anns_tristan.csv"
 # ANNOTATIONS_FILE = "cell_quality_annotations.csv"
 MODEL_CHECKPOINT = "model_checkpoint.pt"
 
@@ -934,6 +935,18 @@ async def homepage(request):
         </div>
         """
 
+    # --- Compute per-image counts for classes 0–2 ---
+    per_image_counts = {}
+    for a_idx, a_lbl in orchestrator.annotations:
+        if a_lbl < 3:  # only first three classes
+            img_num = orchestrator.data_mgr.samples[a_idx]["img_path"]
+            per_image_counts[img_num] = per_image_counts.get(img_num, 0) + 1
+
+    per_image_html = "<h2>Annotations per image (classes 1–3)</h2><ul>"
+    for img, cnt in per_image_counts.items():
+        per_image_html += f"<li>Image {img}: {cnt}</li>"
+    per_image_html += "</ul>"
+
     html = f"""
     <html>
       <head>
@@ -964,6 +977,7 @@ async def homepage(request):
         <p>Press <strong>H</strong> or <strong>?</strong> for keyboard shortcuts</p>
         {help_modal}
         {error_chart_html}
+        {per_image_html}
         {script}
       </body>
     </html>
