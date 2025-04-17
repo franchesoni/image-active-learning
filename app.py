@@ -23,9 +23,11 @@ executor = ThreadPoolExecutor(max_workers=2)
 # Configs
 IMAGE_NUMBER = 1
 CLASS_NAMES = ["Lymphocyte", "Lymphoplasmocyte", "Plasmocyte", "Other"]
+# CLASS_NAMES = ["Bad quality", "Good quality"] 
 REFS_FILE = "instance_references.txt"
 FEATURES_FILE = "features.npy"
 ANNOTATIONS_FILE = "cell_annotations.csv"
+# ANNOTATIONS_FILE = "cell_quality_annotations.csv"
 MODEL_CHECKPOINT = "model_checkpoint.pt"
 
 
