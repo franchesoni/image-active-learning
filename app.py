@@ -21,7 +21,8 @@ from io import BytesIO
 executor = ThreadPoolExecutor(max_workers=2)
 
 # Configs
-REFS_FILE = "instance_references_EXAMPLE.txt"
+IMAGE_NUMBER = 1
+REFS_FILE = "instance_references.txt"
 FEATURES_FILE = "features.npy"
 ANNOTATIONS_FILE = "annotations.csv"
 MODEL_CHECKPOINT = "model_checkpoint.pt"
@@ -30,6 +31,7 @@ MODEL_CHECKPOINT = "model_checkpoint.pt"
 class DataManager:
     def __init__(self, refs_file):
         print("Loading features and references...")
+        self.root = Path("/home/franchesoni/walden")
         self.samples = []
         with open(refs_file, "r") as f:
             for line in f:
@@ -56,8 +58,11 @@ class DataManager:
         if cache_key in self.image_cache:
             return self.image_cache[cache_key]
 
+        sample = self.samples[idx]
+        indx_bbox = [sample["img_path"]] + list(sample["bbox"])
+        img = self._load_image_with_bbox(indx_bbox, center_crop=center_crop)
+        return img
         try:
-            sample = self.samples[idx]
             img = Image.open(sample["img_path"]).convert("RGB")
             bbox = sample["bbox"]
 
@@ -96,6 +101,159 @@ class DataManager:
             draw = ImageDraw.Draw(img)
             draw.text((100, 240), f"Error loading image {idx}", fill=(255, 0, 0))
             return img
+
+    def _load_image_with_bbox(self, bbox, center_crop=False):
+        """
+        Load a 3x3 composite of tiles around the given bounding box and optionally
+        return a 512x512 crop centered on the bounding box.
+
+        Args:
+            bbox (list or tuple): [imgnumber, row, col, height, width]
+                - imgnumber: The image number (e.g., 5 for 'img5')
+                - row, col: Top-left coordinates of the bounding box in global coordinates
+                - height, width: Size of the bounding box
+            center_crop (bool): If True, return a 512x512 crop centered on the bounding box.
+                                If False, return the full 768x768 (3x3 tiles) composite.
+
+        Returns:
+            PIL.Image: The assembled image with bounding box drawn.
+        """
+        # Unpack the bounding box
+        imgnumber, bbox_row, bbox_col, bbox_height, bbox_width = bbox
+
+        TILE_SIZE = 256
+        COMPOSITE_SIZE = TILE_SIZE * 3  # 768x768
+        CROP_SIZE = 512
+        HALF_CROP = CROP_SIZE // 2
+
+        # Directory with tiles
+        imgname = f"img{imgnumber}"
+        tiles_dir = Path(self.root) / f"dataset/{imgname}/tiles"
+
+        # Determine the tile grid start
+        # We find the tile that contains the top-left corner of the bbox
+        tile_row_start = (bbox_row // TILE_SIZE) * TILE_SIZE
+        tile_col_start = (bbox_col // TILE_SIZE) * TILE_SIZE
+
+        # Create a composite image (3x3 tiles)
+        composite_image = Image.new(
+            "RGB", (COMPOSITE_SIZE, COMPOSITE_SIZE), (255, 255, 255)
+        )
+
+        # Load surrounding 3x3 tiles
+        for i, drow in enumerate([-TILE_SIZE, 0, TILE_SIZE]):
+            for j, dcol in enumerate([-TILE_SIZE, 0, TILE_SIZE]):
+                tile_row = tile_row_start + drow
+                tile_col = tile_col_start + dcol
+                tile_name = f"tile_{int(tile_row)}_{int(tile_col)}.jpeg"
+                tile_path = tiles_dir / tile_name
+
+                if tile_path.exists():
+                    try:
+                        tile_image = Image.open(tile_path)
+                        if tile_image.mode != "RGB":
+                            tile_image = tile_image.convert("RGB")
+                        composite_image.paste(
+                            tile_image, (j * TILE_SIZE, i * TILE_SIZE)
+                        )
+                    except Exception as e:
+                        # If tile loading fails, use a placeholder
+                        placeholder = Image.new(
+                            "RGB", (TILE_SIZE, TILE_SIZE), (200, 200, 200)
+                        )
+                        draw_placeholder = ImageDraw.Draw(placeholder)
+                        draw_placeholder.line(
+                            (0, 0) + placeholder.size, fill=(150, 150, 150), width=3
+                        )
+                        draw_placeholder.line(
+                            (0, placeholder.size[1], placeholder.size[0], 0),
+                            fill=(150, 150, 150),
+                            width=3,
+                        )
+                        composite_image.paste(
+                            placeholder, (j * TILE_SIZE, i * TILE_SIZE)
+                        )
+                else:
+                    # Missing tile placeholder
+                    placeholder = Image.new(
+                        "RGB", (TILE_SIZE, TILE_SIZE), (200, 200, 200)
+                    )
+                    draw_placeholder = ImageDraw.Draw(placeholder)
+                    draw_placeholder.line(
+                        (0, 0) + placeholder.size, fill=(150, 150, 150), width=3
+                    )
+                    draw_placeholder.line(
+                        (0, placeholder.size[1], placeholder.size[0], 0),
+                        fill=(150, 150, 150),
+                        width=3,
+                    )
+                    composite_image.paste(placeholder, (j * TILE_SIZE, i * TILE_SIZE))
+
+        # Draw the bounding box on the composite image
+        # Calculate the bounding box coordinates relative to the composite image
+        # The composite image's center tile corresponds to (tile_row_start, tile_col_start) in global coords
+        # Top-left tile in composite is at (tile_row_start - TILE_SIZE, tile_col_start - TILE_SIZE)
+        composite_top_row = tile_row_start - TILE_SIZE
+        composite_left_col = tile_col_start - TILE_SIZE
+
+        bbox_row_rel = bbox_row - composite_top_row
+        bbox_col_rel = bbox_col - composite_left_col
+        bbox_bottom_rel = bbox_row_rel + bbox_height
+        bbox_right_rel = bbox_col_rel + bbox_width
+
+        draw = ImageDraw.Draw(composite_image)
+        draw.rectangle(
+            [
+                bbox_col_rel - 10,
+                bbox_row_rel - 10,
+                bbox_right_rel + 10,
+                bbox_bottom_rel + 10,
+            ],
+            outline="green",
+            width=3,
+        )
+
+        if center_crop:
+            # We want to produce a 512x512 crop centered on the bbox center
+            bbox_center_row = bbox_row_rel + bbox_height / 2
+            bbox_center_col = bbox_col_rel + bbox_width / 2
+
+            # Center the BBox in the crop
+            # The BBox center should map to the center of the crop (256, 256)
+            left = int(bbox_center_col - HALF_CROP)
+            upper = int(bbox_center_row - HALF_CROP)
+            right = left + CROP_SIZE
+            lower = upper + CROP_SIZE
+
+            # Ensure we don't go outside the composite image boundaries
+            if left < 0:
+                right -= left
+                left = 0
+            if upper < 0:
+                lower -= upper
+                upper = 0
+            if right > COMPOSITE_SIZE:
+                left -= right - COMPOSITE_SIZE
+                right = COMPOSITE_SIZE
+            if lower > COMPOSITE_SIZE:
+                upper -= lower - COMPOSITE_SIZE
+                lower = COMPOSITE_SIZE
+
+            # Crop the image
+            cropped_image = composite_image.crop((left, upper, right, lower))
+
+            # If needed, pad to ensure exactly 512x512
+            w, h = cropped_image.size
+            if w < CROP_SIZE or h < CROP_SIZE:
+                padded = Image.new("RGB", (CROP_SIZE, CROP_SIZE), (255, 255, 255))
+                padded.paste(
+                    cropped_image, ((CROP_SIZE - w) // 2, (CROP_SIZE - h) // 2)
+                )
+                cropped_image = padded
+
+            return cropped_image
+        else:
+            return composite_image
 
     def mark_labeled(self, idx):
         self.labeled_indices.add(idx)
@@ -283,8 +441,6 @@ class Orchestrator:
 
         # Calculate and plot error rate (points with brier score < 0.25)
         error_rate = np.cumsum(errors > 0.25) / np.arange(1, len(errors) + 1)
-        print(errors)
-        print(error_rate)
         ax2.plot(indices, error_rate, "b-", linewidth=2, label="Error Rate")
         ax2.tick_params(axis="y", labelcolor="tab:blue")
 
@@ -375,7 +531,7 @@ class Orchestrator:
 
             # Regular annotation process
             with open(self.annotation_file, "a", newline="") as f:
-                csv.writer(f).writerow([idx, label])
+                csv.writer(f).writerow([idx, label, self.data_mgr.samples[idx]["img_path"]] + list(self.data_mgr.samples[idx]["bbox"]))
 
             # Update counters and model
             self.positive_count += 1 if label == 1 else 0
@@ -507,6 +663,9 @@ class Orchestrator:
         if len(unlabeled) == 0:
             print("No more unlabeled samples!")
             return
+        unlabeled = np.array([
+            idx for idx in unlabeled if self.data_mgr.samples[idx]['img_path'] == str(IMAGE_NUMBER)
+        ])
 
         # Get predictions for unlabeled samples
         X = self.data_mgr.feats[unlabeled]
