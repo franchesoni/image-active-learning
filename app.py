@@ -21,7 +21,7 @@ from io import BytesIO
 executor = ThreadPoolExecutor(max_workers=2)
 
 # Configs
-IMAGE_NUMBER = 1
+IMAGE_NUMBER = 4  # None
 CLASS_NAMES = ["Lymphocyte", "Lymphoplasmocyte", "Plasmocyte", "Other"]
 # CLASS_NAMES = ["Bad quality", "Good quality"] 
 # REFS_FILE = "instance_references.txt"
@@ -654,13 +654,14 @@ class Orchestrator:
         if len(unlabeled) == 0:
             print("No more unlabeled samples!")
             return
-        unlabeled = np.array(
-            [
-                idx
-                for idx in unlabeled
-                if self.data_mgr.samples[idx]["img_path"] == str(IMAGE_NUMBER)
-            ]
-        )
+        if IMAGE_NUMBER is not None:
+            unlabeled = np.array(
+                [
+                    idx
+                    for idx in unlabeled
+                    if self.data_mgr.samples[idx]["img_path"] == str(IMAGE_NUMBER)
+                ]
+            )
 
         # Get predictions for unlabeled samples
         X = self.data_mgr.feats[unlabeled]
@@ -785,6 +786,20 @@ async def homepage(request):
             Annotation saved successfully!
         </div>
         """
+
+    # ——— new: fetch bbox & path for display ———
+    sample = orchestrator.data_mgr.samples[idx]
+    img_path = sample["img_path"]
+    bbox = sample["bbox"]  # [imgnum, row, col, h, w]
+    path_html = f"<p><strong>Image file:</strong> {img_path}</p>"
+    bbox_html = ""
+    if bbox:
+        _, r, c, h, w = bbox
+        bbox_html = (
+            f"<p><strong>Bounding‐box:</strong> row={r}, col={c}, "
+            f"height={h}, width={w}</p>"
+        )
+    # ————————————————————————————————
 
     img = orchestrator.data_mgr.get_image(idx, center_crop=True)
     buf = io.BytesIO()
@@ -962,6 +977,8 @@ async def homepage(request):
       </head>
       <body>
         <h1>Sample {idx}</h1>
+        {path_html}
+        {bbox_html}
         {prob_table}
         {counter_html}
         {progress_html}
@@ -1069,3 +1086,9 @@ app = Starlette(
         Route("/revert", revert_handler),
     ],
 )
+
+# to run locally through vscode
+# uvicorn app:app --port 8001
+
+# to expose to the network
+# uvicorn app:app --host 0.0.0.0 --port 2333
