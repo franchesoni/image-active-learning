@@ -876,14 +876,18 @@ async def homepage(request):
 
         // Multi-class: 1,2,3,4 keys for classes
         let keyToClass = {{
-            {"".join([f"'{i+1}': {i}," for i in range(len(CLASS_NAMES))])}
+            {",".join([
+                f"'{{n}}': {i},'Digit{{n}}': {i},'Numpad{{n}}': {i}"
+                .format(n=i+1, i=i)
+                for i in range(len(CLASS_NAMES))
+            ])}
         }};
-        if (event.key in keyToClass) {{
-            submitLabel(keyToClass[event.key], 'classButton'+keyToClass[event.key]);
+        if (event.code in keyToClass) {{
+            submitLabel(keyToClass[event.code], 'classButton'+keyToClass[event.code]);
         }}
 
         // Backspace: revert
-        if (event.key === 'Backspace') {{
+        if (event.code === 'Backspace') {{
             event.preventDefault();
             if (!processingSubmission) {{
                 processingSubmission = true;
@@ -892,10 +896,10 @@ async def homepage(request):
         }}
 
         // Help modal
-        if (event.key === 'h' || event.key === '?') {{
+        if (event.code === 'KeyH' || event.key === '?') {{
             toggleHelp(true);
         }}
-        if (event.key === 'Escape') {{
+        if (event.code === 'Escape') {{
             toggleHelp(false);
         }}
 
