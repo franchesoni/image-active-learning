@@ -714,7 +714,10 @@ class Orchestrator:
         with open(self.annotation_file, "w", newline="") as f:
             writer = csv.writer(f)
             for aidx, albl in self.annotations:
-                writer.writerow([aidx, albl])
+                writer.writerow(
+                                    [aidx, albl, self.data_mgr.samples[aidx]["img_path"]]
+                                    + list(self.data_mgr.samples[aidx]["bbox"])
+                                )
 
         self.data_mgr.unmark_labeled(idx)
         self.retrain(self.annotations)
@@ -794,7 +797,7 @@ async def homepage(request):
     path_html = f"<p><strong>Image file:</strong> {img_path}</p>"
     bbox_html = ""
     if bbox:
-        _, r, c, h, w = bbox
+        r, c, h, w = bbox
         bbox_html = (
             f"<p><strong>Bounding‐box:</strong> row={r}, col={c}, "
             f"height={h}, width={w}</p>"
