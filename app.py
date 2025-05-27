@@ -21,6 +21,7 @@ from io import BytesIO
 executor = ThreadPoolExecutor(max_workers=2)
 
 # Configs
+CLASS_NAMES = ["Positive", "Negative", "Other", "Bad Quality"]  # the classifier will try to predict these
 REFS_FILE = "instance_references_EXAMPLE.txt"
 FEATURES_FILE = "features.npy"
 ANNOTATIONS_FILE = "annotations.csv"
@@ -109,22 +110,28 @@ class DataManager:
         return np.array(list(self.unlabeled_indices))
 
 
-class PyTorchLogisticRegression(nn.Module):
-    def __init__(self, n_features):
+class LinearClassifier(nn.Module):
+    def __init__(self, n_features, num_classes):
         super().__init__()
-        self.linear = nn.Linear(n_features, 1)
+        self.linear = nn.Linear(n_features, num_classes)
+
+    def get_logits(self, x):
+        return self.linear(x)
+
+    def get_probs(self, x):
+        return torch.softmax(self.get_logits(x), dim=1)
 
     def forward(self, x):
-        return torch.sigmoid(self.linear(x))
+        return self.get_logits(x)
 
 
 class IncrementalModel:
     def __init__(self, n_features, n_iter=10, use_ckpt=False):
         self.n_features = n_features
         self.n_iter = n_iter
-        self.model = PyTorchLogisticRegression(n_features)
+        self.model = LinearClassifier(n_features, num_classes=len(CLASS_NAMES))
         self.optimizer = optim.SGD(self.model.parameters(), lr=0.1, weight_decay=0.01)
-        self.loss_fn = nn.BCELoss()
+        self.loss_fn = nn.CrossEntropyLoss()
         self.annotated_feats = []
         self.annotated_labels = []
         self.use_ckpt = use_ckpt
@@ -170,14 +177,14 @@ class IncrementalModel:
         if not self.annotated_feats:
             return
         X = torch.tensor(np.array(self.annotated_feats), dtype=torch.float32)
-        y = torch.tensor(np.array(self.annotated_labels), dtype=torch.float32).view(
-            -1, 1
+        y = torch.tensor(np.array(self.annotated_labels), dtype=torch.long).view(
+            -1
         )
         self.model.train()
         for _ in range(self.n_iter):
             self.optimizer.zero_grad()
-            preds = self.model(X)
-            loss = self.loss_fn(preds, y)
+            pred_logits = self.model(X)
+            loss = self.loss_fn(pred_logits, y)
             loss.backward()
             self.optimizer.step()
             print("Loss:", loss.item(), end="\r")
@@ -188,12 +195,12 @@ class IncrementalModel:
 
     def predict_proba(self, X):
         if not self.annotated_feats:
-            return np.ones((len(X), 2)) * 0.5
+            return np.ones((len(X), len(CLASS_NAMES))) / len(CLASS_NAMES)
         self.model.eval()
         with torch.no_grad():
             X_t = torch.tensor(X, dtype=torch.float32)
-            preds = self.model(X_t).numpy().flatten()
-        return np.stack([1 - preds, preds], axis=1)
+            preds = self.model.get_probs(X_t).numpy()
+        return preds
 
 
 class Orchestrator:
@@ -216,8 +223,7 @@ class Orchestrator:
         self.annotations = []  # list of (idx, label)
         self.current_sample = None
         self.previous_samples = []
-        self.positive_count = 0
-        self.negative_count = 0
+        self.class_counts = [0] * len(CLASS_NAMES)
         self.score_interval = score_interval
         self.error_history = []
         self.current_prediction = None
@@ -283,8 +289,6 @@ class Orchestrator:
 
         # Calculate and plot error rate (points with brier score < 0.25)
         error_rate = np.cumsum(errors > 0.25) / np.arange(1, len(errors) + 1)
-        print(errors)
-        print(error_rate)
         ax2.plot(indices, error_rate, "b-", linewidth=2, label="Error Rate")
         ax2.tick_params(axis="y", labelcolor="tab:blue")
 
@@ -314,8 +318,7 @@ class Orchestrator:
 
     def _load_annotations_and_retrain(self):
         loaded = []
-        self.positive_count = 0
-        self.negative_count = 0
+        self.class_counts = [0] * len(CLASS_NAMES)
         with open(self.annotation_file, "r") as f:
             reader = csv.reader(f)
             for row in reader:
@@ -323,10 +326,7 @@ class Orchestrator:
                     idx, label = int(row[0]), int(row[1])
                     loaded.append((idx, label))
                     # Update counters
-                    if label == 1:
-                        self.positive_count += 1
-                    else:
-                        self.negative_count += 1
+                    self.class_counts[label] += 1
                 except (ValueError, IndexError) as e:
                     print(f"Error loading annotation row: {e}")
         self.retrain(loaded)
@@ -371,15 +371,19 @@ class Orchestrator:
 
             if self.current_prediction is not None and len(self.annotations) > 0:
                 brier = (self.current_prediction - label) ** 2
+                y_true = label
+                y_prob = self.current_prediction
+                y_true_onehot = np.zeros(len(CLASS_NAMES))
+                y_true_onehot[y_true] = 1
+                brier = np.mean((y_prob - y_true_onehot) ** 2)
                 self.error_history.append(brier)
 
             # Regular annotation process
             with open(self.annotation_file, "a", newline="") as f:
                 csv.writer(f).writerow([idx, label])
 
-            # Update counters and model
-            self.positive_count += 1 if label == 1 else 0
-            self.negative_count += 1 if label == 0 else 0
+            # Update counters
+            self.class_counts[label] += 1
 
             feat = self.data_mgr.get_features(idx)
             self.model.add_annotation(feat, label)
@@ -512,7 +516,7 @@ class Orchestrator:
         X = self.data_mgr.feats[unlabeled]
         probs = self.model.predict_proba(X)
 
-        # Calculate cost based on strategy
+        # Calculate based on strategy
         cost = (
             np.abs(probs[:, 1] - 0.5)
             if self.sample_cost == "certainty"
@@ -543,10 +547,7 @@ class Orchestrator:
         self.current_sample = self.previous_samples.pop()
 
         # Update counters properly
-        if label == 1:
-            self.positive_count -= 1
-        else:
-            self.negative_count -= 1
+        self.class_counts[label] -= 1
 
         # Remove the last error point if it exists
         if self.error_history and len(self.error_history) > 0:
@@ -565,7 +566,7 @@ class Orchestrator:
     def get_probability_for(self, idx):
         X = self.data_mgr.get_features(idx)[np.newaxis, :]
         probs = self.model.predict_proba(X)
-        self.current_prediction = probs[0, 1]
+        self.current_prediction = probs[0]  # remove batch dim
         return self.current_prediction
 
 
@@ -584,6 +585,7 @@ async def homepage(request):
     if idx is None:
         total = orchestrator.data_mgr.N
         labeled = len(orchestrator.data_mgr.labeled_indices)
+        class_list = "".join(f"<li>{c}: {orchestrator.class_counts[i]}</li>" for i, c in enumerate(CLASS_NAMES))
         return HTMLResponse(
             f"""
         <html>
@@ -596,8 +598,8 @@ async def homepage(request):
           <body>
             <h1>All images have been annotated!</h1>
             <p>You have completed {labeled} annotations out of {total} total images.</p>
-            <p>Positive annotations: {orchestrator.positive_count}</p>
-            <p>Negative annotations: {orchestrator.negative_count}</p>
+            <p>By class:</p>
+            <ul>{class_list}</ul>
             <p>To restart, relaunch the app.</p>
           </body>
         </html>
@@ -632,8 +634,17 @@ async def homepage(request):
         "utf-8"
     )
 
-    prob = orchestrator.get_probability_for(idx)
-    counter_html = f"<p>Annotations: Positive={orchestrator.positive_count}, Negative={orchestrator.negative_count}</p>"
+    # Get predicted probabilities for all classes
+    prob_vec = orchestrator.get_probability_for(idx)
+    class_counts = orchestrator.class_counts
+
+    # Insert per-class probability table
+    prob_table = "<table style='margin:10px 0;'><tr><th>Class</th><th>Probability</th><th>Count</th></tr>"
+    for i, cname in enumerate(CLASS_NAMES):
+        prob_table += f"<tr><td>{cname}</td><td>{prob_vec[i]:.3f}</td><td>{class_counts[i]}</td></tr>"
+    prob_table += "</table>"
+
+    counter_html = "<p>Counts: " + ", ".join(f"{CLASS_NAMES[i]}={class_counts[i]}" for i in range(len(CLASS_NAMES))) + "</p>"
 
     # Progress bar
     total_samples = orchestrator.data_mgr.N
@@ -654,7 +665,15 @@ async def homepage(request):
         if next_idx is not None
         else ""
     )
-    # Enhanced keyboard handler script
+
+    # --- Multi-class annotation buttons ---
+    # Each button is mapped to a class, with keyboard shortcuts 1,2,3,4...
+    class_buttons_html = ""
+    for i, cname in enumerate(CLASS_NAMES):
+        class_buttons_html += (
+            f'<button type="button" id="classButton{i}" onclick="document.getElementById(\'labelValue\').value=\'{i}\';this.form.submit()">'
+            f"{cname} ({i+1})</button>"
+        )
 
     script = """
     <script>
@@ -674,29 +693,31 @@ async def homepage(request):
         
         lastKeyTime = now;
         
-        // Define keyboard actions mapping
-        const actions = {
-            'a': () => submitLabel('0', 'negButton'),
-            'ArrowLeft': () => submitLabel('0', 'negButton'),
-            'd': () => submitLabel('1', 'posButton'),
-            'ArrowRight': () => submitLabel('1', 'posButton'),
-            'Backspace': () => {
-                event.preventDefault();
-                if (!processingSubmission) {
-                    processingSubmission = true;
-                    window.location.href = '/revert';
-                }
-            },
-            'h': () => toggleHelp(true),
-            '?': () => toggleHelp(true),
-            'Escape': () => toggleHelp(false)
-        };
-        
-        // Execute the action if defined for this key
-        if (actions[event.key]) {
-            actions[event.key]();
-        }
-        
+        // Multi-class: 1,2,3,4 keys for classes
+        let keyToClass = {{
+            {"".join([f"'{i+1}': {i}," for i in range(len(CLASS_NAMES))])}
+        }};
+        if (event.key in keyToClass) {{
+            submitLabel(keyToClass[event.key], 'classButton'+keyToClass[event.key]);
+        }}
+
+        // Backspace: revert
+        if (event.key === 'Backspace') {{
+            event.preventDefault();
+            if (!processingSubmission) {{
+                processingSubmission = true;
+                window.location.href = '/revert';
+            }}
+        }}
+
+        // Help modal
+        if (event.key === 'h' || event.key === '?') {{
+            toggleHelp(true);
+        }}
+        if (event.key === 'Escape') {{
+            toggleHelp(false);
+        }}
+
         function submitLabel(value, buttonId) {
             processingSubmission = true;
             document.getElementById(buttonId).classList.add('active');
@@ -714,12 +735,9 @@ async def homepage(request):
     processingSubmission = false;
     });
 
-    // Add submission control to the form
     document.addEventListener('DOMContentLoaded', function() {
     document.getElementById('labelForm').addEventListener('submit', function() {
-        // Disable buttons to prevent double submission
-        document.getElementById('negButton').disabled = true;
-        document.getElementById('posButton').disabled = true;
+        {"".join([f"document.getElementById('classButton{i}').disabled = true;" for i in range(len(CLASS_NAMES))])}
         
         // Show visual feedback
         document.body.style.opacity = '0.7';
@@ -736,8 +754,7 @@ async def homepage(request):
       <div style="background: white; margin: 100px auto; padding: 20px; width: 60%; border-radius: 10px;">
         <h2>Keyboard Shortcuts</h2>
         <ul>
-          <li><strong>A</strong> or <strong>←</strong>: Negative annotation</li>
-          <li><strong>D</strong> or <strong>→</strong>: Positive annotation</li>
+          {''.join([f"<li><strong>{i+1}</strong>: {cname}</li>" for i, cname in enumerate(CLASS_NAMES)])}
           <li><strong>Backspace</strong>: Revert last annotation</li>
           <li><strong>H</strong> or <strong>?</strong>: Show/hide help</li>
           <li><strong>Esc</strong>: Close help</li>
@@ -773,7 +790,7 @@ async def homepage(request):
       </head>
       <body>
         <h1>Sample {idx}</h1>
-        <p>Predicted Probability: {prob:.3f}</p>
+        {prob_table}
         {counter_html}
         {progress_html}
         {status_message}
@@ -783,8 +800,7 @@ async def homepage(request):
           <input type="hidden" name="idx" value="{idx}"/>
           <input type="hidden" name="request_id" value="{request_id}"/>
           <input type="hidden" name="label" id="labelValue" value=""/>
-          <button type="button" id="negButton" onclick="document.getElementById('labelValue').value='0';this.form.submit()">Negative (a/left)</button>
-          <button type="button" id="posButton" onclick="document.getElementById('labelValue').value='1';this.form.submit()">Positive (d/right)</button>
+          {class_buttons_html}
         </form>
         <p>Press <strong>H</strong> or <strong>?</strong> for keyboard shortcuts</p>
         {help_modal}
@@ -820,7 +836,8 @@ async def label_handler(request):
         request_id = form.get("request_id", str(uuid.uuid4()))
 
         # Validate input
-        if label not in (0, 1):
+        assert type(label) is int, "Label must be an integer"
+        if label not in range(len(CLASS_NAMES)):
             return HTMLResponse("Invalid label value", status_code=400)
 
         # Process the annotation with duplicate checking
