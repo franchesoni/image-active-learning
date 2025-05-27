@@ -211,9 +211,9 @@ class Orchestrator:
         score_interval=8,
         retrain_interval=4,
         n_iter=10,
-        sample_cost="certainty",
+        scoring_method="weighted_least_confidence",
     ):
-        self.sample_cost = sample_cost
+        self.scoring_method = scoring_method
         self.data_mgr = DataManager(refs_file)
         assert self.data_mgr.N > score_interval, "Not enough samples, do it by hand"
         self.model = IncrementalModel(
@@ -329,7 +329,15 @@ class Orchestrator:
                     self.class_counts[label] += 1
                 except (ValueError, IndexError) as e:
                     print(f"Error loading annotation row: {e}")
-        self.retrain(loaded)
+
+        # Use more iterations for initial training if there are enough annotations
+        if len(loaded) > 10:
+            old_n_iter = self.model.n_iter
+            self.model.n_iter = 100  # Increase iterations for initial training
+            self.retrain(loaded)
+            self.model.n_iter = old_n_iter  # Restore original iteration count
+        else:
+            self.retrain(loaded)
 
     def retrain(self, annotations):
         self.data_mgr.labeled_indices.clear()
@@ -370,7 +378,6 @@ class Orchestrator:
                 return False, False
 
             if self.current_prediction is not None and len(self.annotations) > 0:
-                brier = (self.current_prediction - label) ** 2
                 y_true = label
                 y_prob = self.current_prediction
                 y_true_onehot = np.zeros(len(CLASS_NAMES))
@@ -380,7 +387,7 @@ class Orchestrator:
 
             # Regular annotation process
             with open(self.annotation_file, "a", newline="") as f:
-                csv.writer(f).writerow([idx, label])
+                csv.writer(f).writerow([idx, label, self.data_mgr.samples[idx]["img_path"]] + list(self.data_mgr.samples[idx].get("bbox", [])))
 
             # Update counters
             self.class_counts[label] += 1
@@ -517,11 +524,17 @@ class Orchestrator:
         probs = self.model.predict_proba(X)
 
         # Calculate based on strategy
-        cost = (
-            np.abs(probs[:, 1] - 0.5)
-            if self.sample_cost == "certainty"
-            else probs[:, 0]
-        )
+        if self.scoring_method == "weighted_least_confidence":
+            pred_class = np.argmax(probs, axis=1)
+            max_prob = np.max(probs, axis=1)
+            class_weights = 1 / (np.array(self.class_counts) + 1)
+            sample_weights = class_weights[pred_class]
+            uncert = 1 - max_prob
+            score = uncert * sample_weights
+        else:
+            raise ValueError(str(self.scoring_method) + " is not a valid score")
+
+        cost = -score
 
         # Sort and select candidates
         sorted_indices = np.argsort(cost)[: self.score_interval]
@@ -557,7 +570,7 @@ class Orchestrator:
         with open(self.annotation_file, "w", newline="") as f:
             writer = csv.writer(f)
             for aidx, albl in self.annotations:
-                writer.writerow([aidx, albl])
+                writer.writerow([aidx, albl, self.data_mgr.samples[aidx]["img_path"]] + list(self.data_mgr.samples[aidx].get("bbox", [])))
 
         self.data_mgr.unmark_labeled(idx)
         self.retrain(self.annotations)
@@ -576,7 +589,7 @@ orchestrator = Orchestrator(
     annotation_file=ANNOTATIONS_FILE,
     score_interval=8,
     n_iter=10,
-    sample_cost="certainty",
+    scoring_method="weighted_least_confidence",
 )
 
 
@@ -626,6 +639,20 @@ async def homepage(request):
             Annotation saved successfully!
         </div>
         """
+
+    # ——— new: fetch bbox & path for display ———
+    sample = orchestrator.data_mgr.samples[idx]
+    img_path = sample["img_path"]
+    bbox = sample["bbox"]  # [imgnum, row, col, h, w]
+    path_html = f"<p><strong>Image file:</strong> {img_path}</p>"
+    bbox_html = ""
+    if bbox:
+        r, c, h, w = bbox
+        bbox_html = (
+            f"<p><strong>Bounding‐box:</strong> row={r}, col={c}, "
+            f"height={h}, width={w}</p>"
+        )
+    # ————————————————————————————————
 
     img = orchestrator.data_mgr.get_image(idx, center_crop=True)
     buf = io.BytesIO()
@@ -695,14 +722,18 @@ async def homepage(request):
         
         // Multi-class: 1,2,3,4 keys for classes
         let keyToClass = {{
-            {"".join([f"'{i+1}': {i}," for i in range(len(CLASS_NAMES))])}
+            {",".join([
+                f"'{{n}}': {i},'Digit{{n}}': {i},'Numpad{{n}}': {i}"
+                .format(n=i+1, i=i)
+                for i in range(len(CLASS_NAMES))
+            ])}
         }};
-        if (event.key in keyToClass) {{
-            submitLabel(keyToClass[event.key], 'classButton'+keyToClass[event.key]);
+        if (event.code in keyToClass) {{
+            submitLabel(keyToClass[event.code], 'classButton'+keyToClass[event.code]);
         }}
 
         // Backspace: revert
-        if (event.key === 'Backspace') {{
+        if (event.code === 'Backspace') {{
             event.preventDefault();
             if (!processingSubmission) {{
                 processingSubmission = true;
@@ -711,10 +742,10 @@ async def homepage(request):
         }}
 
         // Help modal
-        if (event.key === 'h' || event.key === '?') {{
+        if (event.code === 'KeyH' || event.key === '?') {{
             toggleHelp(true);
         }}
-        if (event.key === 'Escape') {{
+        if (event.code === 'Escape') {{
             toggleHelp(false);
         }}
 
@@ -790,6 +821,8 @@ async def homepage(request):
       </head>
       <body>
         <h1>Sample {idx}</h1>
+        {path_html}
+        {bbox_html}
         {prob_table}
         {counter_html}
         {progress_html}
@@ -897,3 +930,9 @@ app = Starlette(
         Route("/revert", revert_handler),
     ],
 )
+
+# to run locally through vscode
+# uvicorn app:app --port 8001
+
+# to expose to the network
+# uvicorn app:app --host 0.0.0.0 --port 2333
