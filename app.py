@@ -32,13 +32,13 @@ class DataValidationError(Exception):
 # Configuration - hardcoded values (no environment variables)
 class Config:
     # Data paths
-    SAMPLES_FILE = "refs.csv"
-    FEATURES_FILE = "features.npy"
+    SAMPLES_FILE = "example_data/refs.csv"
+    FEATURES_FILE = "example_data/features.npy"
     MODEL_CHECKPOINT = "model_checkpoint.pt"
     STRICT_MODE = True  # Enable strict validation mode
 
     # Class configuration
-    CLASS_NAMES = ["Positive", "Negative", "Other", "Bad Quality"]
+    CLASS_NAMES = ["building", "sea", "forest"]
 
     # Model parameters
     MODEL_N_ITER = 10
@@ -526,7 +526,7 @@ class Orchestrator:
         self.class_counts = [0] * len(Config.CLASS_NAMES)
         self.score_interval = Config.SCORE_INTERVAL
         self.retrain_interval = Config.RETRAIN_INTERVAL
-        self.brier_history = []
+        self.mse_history = []
         self.is_correct_history = []
         self.current_prediction = None
 
@@ -556,38 +556,36 @@ class Orchestrator:
 
     def get_error_chart(self):
         """Generate an error chart with improved styling and dual metrics"""
-        if not self.brier_history or len(self.brier_history) < 2:
+        if not self.mse_history or len(self.mse_history) < 2:
             return None
 
         try:
             # Set matplotlib style for better appearance
             fig, ax1 = plt.subplots(figsize=(12, 6))
 
-            brier_errors = np.array(self.brier_history)
+            mse_errors = np.array(self.mse_history)
             is_correct = np.array(self.is_correct_history)
-            indices = np.arange(len(brier_errors))
+            indices = np.arange(len(mse_errors))
 
-            # Primary y-axis for Brier score
+            # Primary y-axis for mse score
             ax1.set_xlabel("Annotation Count", fontsize=12)
-            ax1.set_ylabel(
-                "Brier Score (lower is better)", color="tab:red", fontsize=12
-            )
-            ax1.set_ylim(0, min(1, np.max(brier_errors) * 1.1))
+            ax1.set_ylabel("mse Score (lower is better)", color="tab:red", fontsize=12)
+            ax1.set_ylim(0, min(1, np.max(mse_errors) * 1.1))
 
             # Plot with improved styling
             ax1.scatter(
                 indices,
-                brier_errors,
+                mse_errors,
                 alpha=0.5,
                 color="tab:red",
                 s=30,
-                label="Brier Score",
+                label="mse Score",
             )
 
             # Regular cumulative average
-            means = np.cumsum(brier_errors) / np.arange(1, len(brier_errors) + 1)
+            means = np.cumsum(mse_errors) / np.arange(1, len(mse_errors) + 1)
             ax1.plot(
-                indices, means, "r--", linewidth=2, label="Avg Brier Score", alpha=0.7
+                indices, means, "r--", linewidth=2, label="Avg mse Score", alpha=0.7
             )
             ax1.tick_params(axis="y", labelcolor="tab:red")
 
@@ -597,8 +595,7 @@ class Orchestrator:
             ax2.set_ylim(0, 1)
 
             # Calculate error rate with threshold
-            threshold = 0.25
-            error_rate = np.cumsum(~is_correct) / np.arange(1, len(is_correct) + 1)
+            error_rate = np.cumsum(1 - is_correct) / np.arange(1, len(is_correct) + 1)
             ax2.plot(indices, error_rate, "b-", linewidth=3, label=f"Error Rate")
             ax2.tick_params(axis="y", labelcolor="tab:blue")
 
@@ -691,12 +688,12 @@ class Orchestrator:
                 y_prob = self.current_prediction
                 y_true_onehot = np.zeros(len(Config.CLASS_NAMES))
                 y_true_onehot[y_true] = 1
-                brier = np.mean((y_prob - y_true_onehot) ** 2)
-                self.brier_history.append(brier)
+                mse = np.mean((y_prob - y_true_onehot) ** 2)
+                self.mse_history.append(mse)
                 is_correct = int(np.argmax(y_prob) == y_true)
                 self.is_correct_history.append(is_correct)
                 logger.debug(
-                    f"Brier score for sample {idx}: {brier:.4f}, {'right' if is_correct else 'wrong'} prediction"
+                    f"mse score for sample {idx}: {mse:.4f}, {'right' if is_correct else 'wrong'} prediction"
                 )
 
             # Save annotation in samples file (update in-memory and write to CSV)
@@ -874,9 +871,9 @@ class Orchestrator:
         self.class_counts[label] -= 1
 
         # Remove the last error point if it exists
-        if self.brier_history and len(self.brier_history) > 0:
+        if self.mse_history and len(self.mse_history) > 0:
             # Just pop the last error, as our error_history now stores scalar values
-            self.brier_history.pop()
+            self.mse_history.pop()
             self.is_correct_history.pop()
 
         # Save all annotations to samples file (overwrite CSV)
