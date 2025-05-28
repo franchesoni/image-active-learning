@@ -3,6 +3,8 @@ import io
 import time
 import uuid
 import asyncio
+import sys
+import logging
 from pathlib import Path
 import numpy as np
 from PIL import Image, ImageDraw
@@ -17,20 +19,71 @@ from concurrent.futures import ThreadPoolExecutor
 import matplotlib.pyplot as plt
 from io import BytesIO
 
-# Create a thread pool for background tasks
-executor = ThreadPoolExecutor(max_workers=2)
 
-# Configs
-CLASS_NAMES = ["Positive", "Negative", "Other", "Bad Quality"]  # the classifier will try to predict these
-REFS_FILE = "instance_references_EXAMPLE.txt"
-FEATURES_FILE = "features.npy"
-ANNOTATIONS_FILE = "annotations.csv"
-MODEL_CHECKPOINT = "model_checkpoint.pt"
+# Configuration - hardcoded values (no environment variables)
+class Config:
+    # Data paths
+    REFS_FILE = "instance_references_EXAMPLE.txt"
+    FEATURES_FILE = "features.npy"
+    ANNOTATIONS_FILE = "annotations.csv"
+    MODEL_CHECKPOINT = "model_checkpoint.pt"
+
+    # Class configuration
+    CLASS_NAMES = ["Positive", "Negative", "Other", "Bad Quality"]
+
+    # Model parameters
+    MODEL_N_ITER = 10
+    MODEL_LEARNING_RATE = 0.1
+    MODEL_WEIGHT_DECAY = 0.01
+
+    # Active learning parameters
+    SCORE_INTERVAL = 8
+    RETRAIN_INTERVAL = 4
+    SCORING_METHOD = "weighted_least_confidence"
+
+    # Cache settings
+    IMAGE_CACHE_SIZE = 20
+
+    # Server settings
+    SAVE_INTERVAL = 300  # seconds
+    THREAD_POOL_SIZE = 2
+
+    # UI settings
+    IMAGE_SIZE = (512, 512)
+    CROP_SIZE = 256
+
+
+# Logging setup
+def setup_logging(log_level="INFO", log_file=None):
+    """Setup logging configuration"""
+    # Create logs directory if it doesn't exist
+    if log_file:
+        Path(log_file).parent.mkdir(parents=True, exist_ok=True)
+
+    # Configure logging
+    log_format = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+
+    handlers = [logging.StreamHandler(sys.stdout)]
+    if log_file:
+        handlers.append(logging.FileHandler(log_file))
+
+    logging.basicConfig(
+        level=getattr(logging, log_level.upper()), format=log_format, handlers=handlers
+    )
+
+    return logging.getLogger(__name__)
+
+
+# Setup logging
+logger = setup_logging("INFO", "logs/app.log")
+
+# Create a thread pool for background tasks
+executor = ThreadPoolExecutor(max_workers=Config.THREAD_POOL_SIZE)
 
 
 class DataManager:
     def __init__(self, refs_file):
-        print("Loading features and references...")
+        logger.info("Loading features and references...")
         self.samples = []
         with open(refs_file, "r") as f:
             for line in f:
@@ -40,14 +93,13 @@ class DataManager:
                 img_path = parts[0]
                 bbox = list(map(int, parts[1:5])) if len(parts) == 5 else None
                 self.samples.append({"img_path": img_path, "bbox": bbox})
-        self.feats = np.load(FEATURES_FILE)
+        self.feats = np.load(Config.FEATURES_FILE)
         self.N = len(self.samples)
         assert self.N == self.feats.shape[0]
         self.labeled_indices = set()
         self.unlabeled_indices = set(range(self.N))
         # Add image caching
         self.image_cache = {}
-        self.cache_size = 20  # Maximum number of images to keep in memory
 
     def get_features(self, idx):
         return self.feats[idx]
@@ -71,29 +123,31 @@ class DataManager:
                 if center_crop:
                     # Center crop around the bounding box
                     cm, rm = (c1 + c2) // 2, (r1 + r2) // 2
+                    crop_size = Config.CROP_SIZE
                     img = img.crop(
                         (
-                            max(cm - 256, 0),
-                            max(rm - 256, 0),
-                            max(cm - 256, 0) + 512,
-                            max(rm - 256, 0) + 512,
+                            max(cm - crop_size, 0),
+                            max(rm - crop_size, 0),
+                            max(cm - crop_size, 0) + 2 * crop_size,
+                            max(rm - crop_size, 0) + 2 * crop_size,
                         )
                     )
                 else:
-                    img = img.resize((512, 512))
+                    img = img.resize(Config.IMAGE_SIZE)
             else:
-                img = img.resize((512, 512))
+                img = img.resize(Config.IMAGE_SIZE)
 
-            # Manage cache
-            if len(self.image_cache) >= self.cache_size:
+            # Manage cache more efficiently
+            if len(self.image_cache) >= Config.IMAGE_CACHE_SIZE:
+                # Remove oldest entry (FIFO)
                 self.image_cache.pop(next(iter(self.image_cache)))
             self.image_cache[cache_key] = img
 
             return img
         except Exception as e:
-            print(f"Error loading image {idx}: {e}")
+            logger.error(f"Error loading image {idx}: {e}")
             # Create error image
-            img = Image.new("RGB", (512, 512), color=(240, 240, 240))
+            img = Image.new("RGB", Config.IMAGE_SIZE, color=(240, 240, 240))
             draw = ImageDraw.Draw(img)
             draw.text((100, 240), f"Error loading image {idx}", fill=(255, 0, 0))
             return img
@@ -126,34 +180,38 @@ class LinearClassifier(nn.Module):
 
 
 class IncrementalModel:
-    def __init__(self, n_features, n_iter=10, use_ckpt=False):
+    def __init__(self, n_features, n_iter, use_ckpt):
         self.n_features = n_features
         self.n_iter = n_iter
-        self.model = LinearClassifier(n_features, num_classes=len(CLASS_NAMES))
-        self.optimizer = optim.SGD(self.model.parameters(), lr=0.1, weight_decay=0.01)
+        self.model = LinearClassifier(n_features, num_classes=len(Config.CLASS_NAMES))
+        self.optimizer = optim.SGD(
+            self.model.parameters(),
+            lr=Config.MODEL_LEARNING_RATE,
+            weight_decay=Config.MODEL_WEIGHT_DECAY,
+        )
         self.loss_fn = nn.CrossEntropyLoss()
         self.annotated_feats = []
         self.annotated_labels = []
         self.use_ckpt = use_ckpt
+        self.training_history = []
 
         if use_ckpt:
-            # Try to load existing model if available
             self._try_load_checkpoint()
 
     def _try_load_checkpoint(self):
         try:
-            checkpoint_path = Path(MODEL_CHECKPOINT)
+            checkpoint_path = Path(Config.MODEL_CHECKPOINT)
             if checkpoint_path.exists():
                 checkpoint = torch.load(checkpoint_path)
                 self.model.load_state_dict(checkpoint["model_state_dict"])
                 self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-                print("Loaded model checkpoint")
+                logger.info("Loaded model checkpoint")
         except Exception as e:
-            print(f"Could not load model checkpoint: {e}")
+            logger.error(f"Could not load model checkpoint: {e}")
 
     def save_checkpoint(self):
         try:
-            checkpoint_path = Path(MODEL_CHECKPOINT)
+            checkpoint_path = Path(Config.MODEL_CHECKPOINT)
             torch.save(
                 {
                     "model_state_dict": self.model.state_dict(),
@@ -161,9 +219,9 @@ class IncrementalModel:
                 },
                 checkpoint_path,
             )
-            print(f"Model checkpoint saved at {time.strftime('%H:%M:%S')}")
+            logger.info(f"Model checkpoint saved at {time.strftime('%H:%M:%S')}")
         except Exception as e:
-            print(f"Failed to save model: {e}")
+            logger.error(f"Failed to save model: {e}")
 
     def add_annotation(self, feat, label):
         self.annotated_feats.append(feat)
@@ -176,18 +234,26 @@ class IncrementalModel:
     def fit(self):
         if not self.annotated_feats:
             return
+
+        logger.info(f"Training model with {len(self.annotated_feats)} samples")
         X = torch.tensor(np.array(self.annotated_feats), dtype=torch.float32)
-        y = torch.tensor(np.array(self.annotated_labels), dtype=torch.long).view(
-            -1
-        )
+        y = torch.tensor(np.array(self.annotated_labels), dtype=torch.long).view(-1)
+
         self.model.train()
+        losses = []
         for _ in range(self.n_iter):
             self.optimizer.zero_grad()
             pred_logits = self.model(X)
             loss = self.loss_fn(pred_logits, y)
             loss.backward()
             self.optimizer.step()
+
+            losses.append(loss.item())
             print("Loss:", loss.item(), end="\r")
+
+        # Update learning rate
+        avg_loss = np.mean(losses)
+        self.training_history.append(avg_loss)
 
         # Save the model after training
         if self.use_ckpt:
@@ -195,7 +261,7 @@ class IncrementalModel:
 
     def predict_proba(self, X):
         if not self.annotated_feats:
-            return np.ones((len(X), len(CLASS_NAMES))) / len(CLASS_NAMES)
+            return np.ones((len(X), len(Config.CLASS_NAMES))) / len(Config.CLASS_NAMES)
         self.model.eval()
         with torch.no_grad():
             X_t = torch.tensor(X, dtype=torch.float32)
@@ -208,24 +274,36 @@ class Orchestrator:
         self,
         refs_file,
         annotation_file,
-        score_interval=8,
-        retrain_interval=4,
-        n_iter=10,
-        scoring_method="weighted_least_confidence",
+        score_interval,
+        retrain_interval,
+        n_iter,
+        scoring_method,
+        use_ckpt,
     ):
         self.scoring_method = scoring_method
         self.data_mgr = DataManager(refs_file)
-        assert self.data_mgr.N > score_interval, "Not enough samples, do it by hand"
+
+        # Validate configuration
+        score_interval = score_interval
+        assert (
+            self.data_mgr.N > score_interval
+        ), f"Not enough samples ({self.data_mgr.N}), need at least {score_interval} to run active learning, annotate in a txt yourself."
+
         self.model = IncrementalModel(
-            n_features=self.data_mgr.feats.shape[1], n_iter=n_iter
+            n_features=self.data_mgr.feats.shape[1],
+            n_iter=n_iter,
+            use_ckpt=use_ckpt,
         )
+        self.use_ckpt = use_ckpt
         self.annotation_file = Path(annotation_file)
         self.annotations = []  # list of (idx, label)
         self.current_sample = None
         self.previous_samples = []
-        self.class_counts = [0] * len(CLASS_NAMES)
+        self.class_counts = [0] * len(Config.CLASS_NAMES)
         self.score_interval = score_interval
-        self.error_history = []
+        self.retrain_interval = retrain_interval
+        self.brier_history = []
+        self.is_correct_history = []
         self.current_prediction = None
 
         # Add tracking for skipped samples
@@ -235,15 +313,12 @@ class Orchestrator:
         self.review_indices = []
 
         # Batch processing
-        self.retrain_interval = retrain_interval  # Update model every N annotations
         self.annotations_since_update = 0
 
         # Prevent duplicate submissions
         self.last_processed_request = None
         self.last_processed_time = 0
         self.processing_lock = False
-        self.last_save_timestamp = time.time()
-        self.save_interval = 300  # 5 minutes
 
         # Initialize candidates
         self.candidates = np.random.choice(
@@ -256,69 +331,81 @@ class Orchestrator:
         self._ensure_next_sample()
 
     def get_error_chart(self):
-        """Generate an error chart as base64 encoded image with dual y-axes"""
-        if not self.error_history or len(self.error_history) < 2:
+        """Generate an error chart with improved styling and dual metrics"""
+        if not self.brier_history or len(self.brier_history) < 2:
             return None
 
-        # Create figure with appropriate size
-        fig, ax1 = plt.subplots(figsize=(10, 5))
+        try:
+            # Set matplotlib style for better appearance
+            fig, ax1 = plt.subplots(figsize=(12, 6))
 
-        # Extract data - ensure we're working with numpy arrays for operations
-        errors = np.array(self.error_history)
-        indices = np.arange(len(errors))
+            brier_errors = np.array(self.brier_history)
+            is_correct = np.array(self.is_correct_history)
+            indices = np.arange(len(brier_errors))
 
-        # Primary y-axis for Brier score (left)
-        ax1.set_xlabel("Annotation Count")
-        ax1.set_ylabel("Brier Score (lower is better)", color="tab:red")
-        ax1.set_ylim(0, 1)  # Brier score range
+            # Primary y-axis for Brier score
+            ax1.set_xlabel("Annotation Count", fontsize=12)
+            ax1.set_ylabel(
+                "Brier Score (lower is better)", color="tab:red", fontsize=12
+            )
+            ax1.set_ylim(0, min(1, np.max(brier_errors) * 1.1))
 
-        # Plot individual points for Brier score
-        ax1.scatter(
-            indices, errors, alpha=0.5, color="tab:red", s=20, label="Brier Score"
-        )
+            # Plot with improved styling
+            ax1.scatter(
+                indices,
+                brier_errors,
+                alpha=0.5,
+                color="tab:red",
+                s=30,
+                label="Brier Score",
+            )
 
-        # Calculate and plot cumulative average
-        means = np.cumsum(errors) / np.arange(1, len(errors) + 1)
-        ax1.plot(indices, means, "r-", linewidth=2, label="Avg Brier Score")
-        ax1.tick_params(axis="y", labelcolor="tab:red")
+            # Regular cumulative average
+            means = np.cumsum(brier_errors) / np.arange(1, len(brier_errors) + 1)
+            ax1.plot(
+                indices, means, "r--", linewidth=2, label="Avg Brier Score", alpha=0.7
+            )
+            ax1.tick_params(axis="y", labelcolor="tab:red")
 
-        # Create second y-axis for error rate (right)
-        ax2 = ax1.twinx()
-        ax2.set_ylabel("Error Rate", color="tab:blue")
-        ax2.set_ylim(0, 1)  # Error rate range
+            # Secondary y-axis for error rate
+            ax2 = ax1.twinx()
+            ax2.set_ylabel("Error Rate", color="tab:blue", fontsize=12)
+            ax2.set_ylim(0, 1)
 
-        # Calculate and plot error rate (points with brier score < 0.25)
-        error_rate = np.cumsum(errors > 0.25) / np.arange(1, len(errors) + 1)
-        ax2.plot(indices, error_rate, "b-", linewidth=2, label="Error Rate")
-        ax2.tick_params(axis="y", labelcolor="tab:blue")
+            # Calculate error rate with threshold
+            threshold = 0.25
+            error_rate = np.cumsum(~is_correct) / np.arange(1, len(is_correct) + 1)
+            ax2.plot(indices, error_rate, "b-", linewidth=3, label=f"Error Rate")
+            ax2.tick_params(axis="y", labelcolor="tab:blue")
 
-        # Add grid lines for better readability
-        ax1.grid(True, alpha=0.3)
+            # Improved styling
+            ax1.grid(True, alpha=0.3)
+            plt.title("Model Performance Over Time", fontsize=14, fontweight="bold")
 
-        # Add title
-        plt.title("Model Performance Over Time")
+            # Combined legend
+            lines1, labels1 = ax1.get_legend_handles_labels()
+            lines2, labels2 = ax2.get_legend_handles_labels()
+            ax1.legend(lines1 + lines2, labels1 + labels2, loc="upper right")
 
-        # Add combined legend
-        lines1, labels1 = ax1.get_legend_handles_labels()
-        lines2, labels2 = ax2.get_legend_handles_labels()
-        ax1.legend(lines1 + lines2, labels1 + labels2, loc="best")
+            fig.tight_layout()
 
-        # Tight layout to optimize spacing
-        fig.tight_layout()
+            # Convert to base64
+            buf = BytesIO()
+            plt.savefig(buf, format="png", dpi=120, bbox_inches="tight")
+            plt.close(fig)
+            buf.seek(0)
+            img_png = buf.getvalue()
+            buf.close()
 
-        # Convert plot to base64 image
-        buf = BytesIO()
-        plt.savefig(buf, format="png", dpi=100)
-        plt.close(fig)
-        buf.seek(0)
-        img_png = buf.getvalue()
-        buf.close()
+            return base64.b64encode(img_png).decode("utf-8")
 
-        return base64.b64encode(img_png).decode("utf-8")
+        except Exception as e:
+            logger.error(f"Error generating chart: {e}")
+            return None
 
     def _load_annotations_and_retrain(self):
         loaded = []
-        self.class_counts = [0] * len(CLASS_NAMES)
+        self.class_counts = [0] * len(Config.CLASS_NAMES)
         with open(self.annotation_file, "r") as f:
             reader = csv.reader(f)
             for row in reader:
@@ -328,7 +415,7 @@ class Orchestrator:
                     # Update counters
                     self.class_counts[label] += 1
                 except (ValueError, IndexError) as e:
-                    print(f"Error loading annotation row: {e}")
+                    logger.warning(f"Error loading annotation row: {e}")
 
         # Use more iterations for initial training if there are enough annotations
         if len(loaded) > 10:
@@ -358,44 +445,53 @@ class Orchestrator:
         return self.next_sample
 
     def handle_annotation(self, idx, label, request_id=None):
-        # Prevent duplicate submissions
+        # Enhanced duplicate detection
         current_time = time.time()
         if (
             idx == self.last_processed_request
-            and current_time - self.last_processed_time < 0.5
+            and current_time - self.last_processed_time < 1.0  # Increased threshold
         ) or self.processing_lock:
-            print(
-                f"Skipping annotation: {'duplicate request' if idx == self.last_processed_request else 'processing lock active'}"
-            )
+            logger.warning(f"Skipping duplicate annotation for index {idx}")
             return False, False
 
         try:
             self.processing_lock = True
+            logger.info(f"Processing annotation: idx={idx}, label={label}")
 
-            # Check if this index is already annotated
+            # Check if already annotated
             if idx in {a[0] for a in self.annotations}:
-                print(f"Index {idx} was already annotated, skipping")
+                logger.warning(f"Index {idx} already annotated")
                 return False, False
 
+            # Calculate prediction error if we have a prediction
             if self.current_prediction is not None and len(self.annotations) > 0:
                 y_true = label
                 y_prob = self.current_prediction
-                y_true_onehot = np.zeros(len(CLASS_NAMES))
+                y_true_onehot = np.zeros(len(Config.CLASS_NAMES))
                 y_true_onehot[y_true] = 1
                 brier = np.mean((y_prob - y_true_onehot) ** 2)
-                self.error_history.append(brier)
+                self.brier_history.append(brier)
+                is_correct = int(np.argmax(y_prob) == y_true)
+                self.is_correct_history.append(is_correct)
+                logger.debug(
+                    f"Brier score for sample {idx}: {brier:.4f}, {'right' if is_correct else 'wrong'} prediction"
+                )
 
-            # Regular annotation process
+            # Save annotation
+            sample = self.data_mgr.samples[idx]
             with open(self.annotation_file, "a", newline="") as f:
-                csv.writer(f).writerow([idx, label, self.data_mgr.samples[idx]["img_path"]] + list(self.data_mgr.samples[idx].get("bbox", [])))
+                writer = csv.writer(f)
+                row = [idx, label, sample["img_path"]]
+                if sample.get("bbox"):
+                    row.extend(sample["bbox"])
+                writer.writerow(row)
 
-            # Update counters
+            # Update internal state
             self.class_counts[label] += 1
-
             feat = self.data_mgr.get_features(idx)
             self.model.add_annotation(feat, label)
 
-            # Track annotation and update sample selection
+            # Update tracking
             self.annotations_since_update += 1
             should_fit_model = self.annotations_since_update >= self.retrain_interval
             if should_fit_model:
@@ -405,21 +501,16 @@ class Orchestrator:
             self.annotations.append((idx, label))
             self.previous_samples.append(self.current_sample)
 
-            # Periodic model saving
-            current_time = time.time()
-            if current_time - self.last_save_timestamp > self.save_interval:
-                self.model.save_checkpoint()
-                self.last_save_timestamp = current_time
-
-            # Update request tracking
+            # Update tracking
             self.last_processed_request = idx
             self.last_processed_time = current_time
             self._pick_next_sample()
 
+            logger.info(f"Successfully processed annotation for index {idx}")
             return True, should_fit_model
 
         except Exception as e:
-            print(f"Error processing annotation: {e}")
+            logger.error(f"Error processing annotation: {e}")
             return False, False
         finally:
             self.processing_lock = False
@@ -434,7 +525,7 @@ class Orchestrator:
             return False
 
         self.skipped_indices.add(self.current_sample)
-        print(f"Skipped sample {self.current_sample}")
+        logger.info(f"Skipped sample {self.current_sample}")
         self._pick_next_sample()
         return True
 
@@ -501,7 +592,7 @@ class Orchestrator:
             next_sample = next(iter(self.skipped_indices))
             self.current_sample = next_sample
             self.skipped_indices.remove(next_sample)
-            print(f"Showing previously skipped sample {self.current_sample}")
+            logger.info(f"Showing previously skipped sample {self.current_sample}")
         else:
             self.current_sample = None
 
@@ -516,7 +607,7 @@ class Orchestrator:
         # Get unlabeled indices
         unlabeled = self.data_mgr.get_unlabeled_indices()
         if len(unlabeled) == 0:
-            print("No more unlabeled samples!")
+            logger.info("No more unlabeled samples!")
             return
 
         # Get predictions for unlabeled samples
@@ -547,7 +638,7 @@ class Orchestrator:
 
         # Fall back to random sampling if needed
         if not self.candidates and len(unlabeled) > 0:
-            print("Falling back to random sampling")
+            logger.info("Falling back to random sampling")
             self.candidates = np.random.choice(
                 unlabeled, min(self.score_interval, len(unlabeled)), replace=False
             ).tolist()
@@ -563,14 +654,18 @@ class Orchestrator:
         self.class_counts[label] -= 1
 
         # Remove the last error point if it exists
-        if self.error_history and len(self.error_history) > 0:
+        if self.brier_history and len(self.brier_history) > 0:
             # Just pop the last error, as our error_history now stores scalar values
-            self.error_history.pop()
+            self.brier_history.pop()
+            self.is_correct_history.pop()
 
         with open(self.annotation_file, "w", newline="") as f:
             writer = csv.writer(f)
             for aidx, albl in self.annotations:
-                writer.writerow([aidx, albl, self.data_mgr.samples[aidx]["img_path"]] + list(self.data_mgr.samples[aidx].get("bbox", [])))
+                writer.writerow(
+                    [aidx, albl, self.data_mgr.samples[aidx]["img_path"]]
+                    + list(self.data_mgr.samples[aidx].get("bbox", []))
+                )
 
         self.data_mgr.unmark_labeled(idx)
         self.retrain(self.annotations)
@@ -583,13 +678,16 @@ class Orchestrator:
         return self.current_prediction
 
 
-print("Starting the orchestrator...")
+# Initialize with configuration
+logger.info("Starting the orchestrator...")
 orchestrator = Orchestrator(
-    refs_file=REFS_FILE,
-    annotation_file=ANNOTATIONS_FILE,
-    score_interval=8,
-    n_iter=10,
-    scoring_method="weighted_least_confidence",
+    refs_file=Config.REFS_FILE,
+    annotation_file=Config.ANNOTATIONS_FILE,
+    score_interval=Config.SCORE_INTERVAL,
+    retrain_interval=Config.RETRAIN_INTERVAL,
+    n_iter=Config.MODEL_N_ITER,
+    scoring_method=Config.SCORING_METHOD,
+    use_ckpt=Config.MODEL_CHECKPOINT is not None,
 )
 
 
@@ -598,22 +696,29 @@ async def homepage(request):
     if idx is None:
         total = orchestrator.data_mgr.N
         labeled = len(orchestrator.data_mgr.labeled_indices)
-        class_list = "".join(f"<li>{c}: {orchestrator.class_counts[i]}</li>" for i, c in enumerate(CLASS_NAMES))
+        class_list = "".join(
+            f"<li>{c}: {orchestrator.class_counts[i]}</li>"
+            for i, c in enumerate(Config.CLASS_NAMES)
+        )
         return HTMLResponse(
             f"""
         <html>
           <head>
             <title>Active Learning Complete</title>
+            <meta name="viewport" content="width=device-width, initial-scale=1.0">
             <style>
               body {{ font-family: Arial, sans-serif; max-width: 600px; margin: 40px auto; padding: 20px; }}
+              .completion-stats {{ background: #f8f9fa; padding: 20px; border-radius: 8px; margin: 20px 0; }}
             </style>
           </head>
           <body>
-            <h1>All images have been annotated!</h1>
-            <p>You have completed {labeled} annotations out of {total} total images.</p>
-            <p>By class:</p>
-            <ul>{class_list}</ul>
-            <p>To restart, relaunch the app.</p>
+            <h1>🎉 All images have been annotated!</h1>
+            <div class="completion-stats">
+              <p><strong>Total annotations:</strong> {labeled} out of {total}</p>
+              <p><strong>Class distribution:</strong></p>
+              <ul>{class_list}</ul>
+            </div>
+            <p><em>To restart, relaunch the application.</em></p>
           </body>
         </html>
         """
@@ -667,11 +772,18 @@ async def homepage(request):
 
     # Insert per-class probability table
     prob_table = "<table style='margin:10px 0;'><tr><th>Class</th><th>Probability</th><th>Count</th></tr>"
-    for i, cname in enumerate(CLASS_NAMES):
+    for i, cname in enumerate(Config.CLASS_NAMES):
         prob_table += f"<tr><td>{cname}</td><td>{prob_vec[i]:.3f}</td><td>{class_counts[i]}</td></tr>"
     prob_table += "</table>"
 
-    counter_html = "<p>Counts: " + ", ".join(f"{CLASS_NAMES[i]}={class_counts[i]}" for i in range(len(CLASS_NAMES))) + "</p>"
+    counter_html = (
+        "<p>Counts: "
+        + ", ".join(
+            f"{Config.CLASS_NAMES[i]}={class_counts[i]}"
+            for i in range(len(Config.CLASS_NAMES))
+        )
+        + "</p>"
+    )
 
     # Progress bar
     total_samples = orchestrator.data_mgr.N
@@ -696,7 +808,7 @@ async def homepage(request):
     # --- Multi-class annotation buttons ---
     # Each button is mapped to a class, with keyboard shortcuts 1,2,3,4...
     class_buttons_html = ""
-    for i, cname in enumerate(CLASS_NAMES):
+    for i, cname in enumerate(Config.CLASS_NAMES):
         class_buttons_html += (
             f'<button type="button" id="classButton{i}" onclick="document.getElementById(\'labelValue\').value=\'{i}\';this.form.submit()">'
             f"{cname} ({i+1})</button>"
@@ -725,7 +837,7 @@ async def homepage(request):
             {",".join([
                 f"'{{n}}': {i},'Digit{{n}}': {i},'Numpad{{n}}': {i}"
                 .format(n=i+1, i=i)
-                for i in range(len(CLASS_NAMES))
+                for i in range(len(Config.CLASS_NAMES))
             ])}
         }};
         if (event.code in keyToClass) {{
@@ -768,7 +880,7 @@ async def homepage(request):
 
     document.addEventListener('DOMContentLoaded', function() {
     document.getElementById('labelForm').addEventListener('submit', function() {
-        {"".join([f"document.getElementById('classButton{i}').disabled = true;" for i in range(len(CLASS_NAMES))])}
+        {"".join([f"document.getElementById('classButton{i}').disabled = true;" for i in range(len(Config.CLASS_NAMES))])}
         
         // Show visual feedback
         document.body.style.opacity = '0.7';
@@ -785,7 +897,7 @@ async def homepage(request):
       <div style="background: white; margin: 100px auto; padding: 20px; width: 60%; border-radius: 10px;">
         <h2>Keyboard Shortcuts</h2>
         <ul>
-          {''.join([f"<li><strong>{i+1}</strong>: {cname}</li>" for i, cname in enumerate(CLASS_NAMES)])}
+          {''.join([f"<li><strong>{i+1}</strong>: {cname}</li>" for i, cname in enumerate(Config.CLASS_NAMES)])}
           <li><strong>Backspace</strong>: Revert last annotation</li>
           <li><strong>H</strong> or <strong>?</strong>: Show/hide help</li>
           <li><strong>Esc</strong>: Close help</li>
@@ -853,7 +965,7 @@ async def prefetch_handler(request):
         img.save(buf, format="JPEG")
         return Response(buf.getvalue(), media_type="image/jpeg")
     except Exception as e:
-        print(f"Error in prefetch: {e}")
+        logger.error(f"Error in prefetch: {e}")
         # Return a transparent 1x1 pixel GIF
         return Response(
             b"GIF89a\x01\x00\x01\x00\x80\x00\x00\xff\xff\xff\x00\x00\x00!\xf9\x04\x01\x00\x00\x00\x00,\x00\x00\x00\x00\x01\x00\x01\x00\x00\x02\x02D\x01\x00;",
@@ -870,7 +982,7 @@ async def label_handler(request):
 
         # Validate input
         assert type(label) is int, "Label must be an integer"
-        if label not in range(len(CLASS_NAMES)):
+        if label not in range(len(Config.CLASS_NAMES)):
             return HTMLResponse("Invalid label value", status_code=400)
 
         # Process the annotation with duplicate checking
