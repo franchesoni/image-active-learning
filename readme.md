@@ -1,10 +1,41 @@
-# Binary Annotation of Images with Active Learning
+# Annotate Images into Classes Fast! 
 
-A fast, efficient tool for annotating images with binary labels using active learning to maximize annotation efficiency.
+A fast, efficient tool for annotating images with labels using active learning to maximize annotation efficiency.
 
-## Overview
+## Requirements
 
-This tool provides a web-based interface for binary image annotation with active learning strategies that prioritize the most informative samples, helping you:
+**What you need to try it:**
+- a `.csv` file with columns `filename`, `bbox`, `annotation`, and `feat_idx`
+- a `.npy` file with a feature vector associated to each image
+- a prepared environment
+
+### Need help getting those ready?
+**Environment:**
+- download `uv` or your preferred package manager: `curl -LsSf https://astral.sh/uv/install.sh | sh` (if you don't use `uv` the commands change a little)
+- create your virtual environment: `uv venv --python=3.12` (other python versions weren't tested but should work) and activate it `source .venv/bin/activate`
+- install the requirements `uv pip install -r requirements.txt`
+
+**`.csv` file**
+We have some example data. Initially it only contained the images. Then we run:
+- `find example_data/images/ -type f -name "*.jpg" > example_data/filenames.txt` to create a list of images
+- `python compute_features.py csv --path_to_filenames='example_data/filenames.txt' --out='example_data/refs.csv'` to convert the list of files to the `.csv` format the app expects
+
+**`.npy` file**
+You can compute the features yourself however you think best, but the DINOv2reg-small baseline is provided as an starting point:
+- run `python compute_features.py main --refs='example_data/refs.csv' --out='example_data/features.npy'` to create the feature file and add the feature index for each sample to the `.csv`
+
+If you do it yourself, remember that `.npy` should be a matrix and that each of the `feat_idx` values in the `.csv` should correspond to the row in the matrix that contains the feature vector for the sample. 
+
+## Demo
+Starting from your own folder with images, you can follow the steps above. If you want to see what the app looks like (and you have cloned the repo and set up your environment), run
+
+`uvicorn app:app --port 8001`
+
+to launch the app, and open [localhost:8001](http://127.0.0.1:8001) in your browser to start annotating. Note that the configuration settings for the app (such as the class names) are at the top of `app.py`.
+
+
+## Pitch
+This tool provides a web-based interface for image annotation with active learning strategies that prioritize the most informative samples, helping you:
 
 - Build high-quality datasets quickly
 - Focus human effort on the most valuable samples
@@ -16,82 +47,50 @@ This tool provides a web-based interface for binary image annotation with active
 - **Detection refinement**: Filter bounding box proposals from general detection models (like SAM)  
 - **Object classification**: Quickly build binary classifiers (e.g., defective vs. non-defective parts)
 - **Data cleaning**: Identify and remove outliers or mislabeled images
-
-## Active Learning Strategies
-
-The tool offers two methods for selecting samples:
-
-1. **Entropy maximization (certainty)**: Prioritizes samples where the model is most uncertain (probability near 0.5)
-2. **Maximum probability**: Optimized for finding rare positives/negatives by focusing on samples with high model confidence
+- **General annotation**: Simply create your own ImageNet dataset.
 
 ## Features
 
+- **Optimized sample selection** using active learning (see below!)
 - **Keyboard shortcuts** for rapid annotation
-- **Real-time error metrics** to track model improvement
+- **Real-time error metrics** to track model improvement. This is cool: every sample you annotate is an unseen sample for the model, therefore we can compute a generalization error while you annotate, and see if the model improves!
 - **Progress tracking** with visual indicators
 - **Annotation reverting** capability
 - **Prefetching** for smoother experience
-- **Optimized sample selection** using active learning
 
-## Requirements
+### Active Learning Strategy
 
-- Python 3.7+
-- Required packages: `pip install -r requirements.txt`
-- A list of images paths OR image paths with bounding boxes (see `instance_references_EXAMPLE.txt`), e.g.:
-```
-/path/to/image1.jpg
-/path/to/image2.jpg row1 col1 row2 col2  # Optional bounding box coordinates (top-left and bottom-right corners)
-```
+We use an uncertainty-based method that also accounts for the number of annotations in each class. Mathematically, we compute the score $s$ for each sample as: 
+
+$$ s = (1- p(c_\max)) / (A(c_\max)+1)  $$
+
+where $c_\max = \arg\max_c p(c)$ is the probability of the predicted class and $A(c)$ is the number of annotations made so far for class $c$. 
 
 
-## Quick Start
 
-### 1. Compute Features
 
-Feature extraction is critical for active learning performance. Choose one of these methods:
 
-```bash
-# Using DINOv2 (recommended)
-python compute_features.py --refs='instance_references_EXAMPLE.txt'
-
-# Specify batch size and workers based on your hardware
-python compute_features.py --refs='your_paths_file.txt' --batch_size=32 --num_workers=4
-
-# Generate features with a custom output path
-python compute_features.py --refs='your_paths_file.txt' --out='custom_features.npy'
-```
-### 2. Launch Annotation Interface
-```bash
-uvicorn app:app --port 8000
-```
-Then open your browser to http://127.0.0.1:8000 to start annotating.
-
-### 3. Annotation Controls
+### Annotation Controls
 - A / Left Arrow: Label as Negative
 - D / Right Arrow: Label as Positive
 - Backspace: Revert last annotation
 - H / ?: Show keyboard shortcuts
 
-## Performance Tips
-- Start with just 10-20 minutes of annotation to get early results
+### Performance Tips
+- Start with just 5 minutes of annotation to get early results
 - Take short breaks to avoid annotation fatigue
 - The model improves as you annotate more samples, so efficiency increases over time
-- For highly imbalanced data, use "maximum probability" strategy to find rare classes
+- Expect about 1000 images per hour on average (around 3s per image).
 
-## Advanced Configuration
-Edit the constants at the top of app.py to customize paths and behavior:
+### Advanced Configuration
+Edit the constants at the top of `app.py` to customize paths and behavior:
 
-```python
-REFS_FILE = "your_custom_paths.txt"
-FEATURES_FILE = "your_features.npy"
-ANNOTATIONS_FILE = "your_annotations.csv"
-```
-
-## Interpreting the Error Chart
+### Interpreting the Error Chart
 The error visualization shows:
 
-- Red points: Individual Brier scores (lower is better)
-- Red line: Average Brier score
-- Blue line: Error rate (incorrect predictions)
-As annotation progresses, both lines should trend downward, indicating model improvement.
+- Red points: Individual mean squared errors (MSE) (lower is better)
+- Red line: Average MSE 
+- Blue line: Error rate (percentage of incorrect predictions)
+For both, lower is better!
+
 

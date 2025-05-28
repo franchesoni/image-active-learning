@@ -4,6 +4,7 @@ Pillow
 starlette
 timm
 torch
+pandas
 uvicorn
 matplotlib
 python-multipart
