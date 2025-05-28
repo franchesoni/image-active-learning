@@ -7,24 +7,26 @@ import timm
 from PIL import Image
 import fire
 from torch.utils.data import Dataset, DataLoader
+import pandas as pd
 
 
 class InstancesDataset(Dataset):
     def __init__(self, refs_file, transform):
         self.transform = transform
         self.samples = []
-        with open(refs_file, "r") as f:
-            for line in f:
-                parts = line.strip().split()
-                if not parts:
-                    continue
-                img_path = parts[0]
-                bbox = (
-                    torch.tensor(list(map(int, parts[1:5])))
-                    if len(parts) == 5
-                    else torch.tensor([-1, -1, -1, -1])
-                )
-                self.samples.append({"img_path": img_path, "bbox": bbox})
+        df = pd.read_csv(refs_file)
+        for _, row in df.iterrows():
+            img_path = row["filename"]
+            bbox_str = row.get("bbox", "")
+            if isinstance(bbox_str, str) and bbox_str.strip() != "":
+                try:
+                    # Expect bbox as 'top_row-left_col-bottom_row-right_col'
+                    bbox = torch.tensor(list(map(int, bbox_str.strip().split("-"))))
+                except Exception:
+                    raise ValueError(f"Invalid bbox format in {img_path}: {bbox_str}")
+            else:
+                bbox = torch.tensor([-1, -1, -1, -1])
+            self.samples.append({"img_path": img_path, "bbox": bbox})
 
     def __len__(self):
         return len(self.samples)
@@ -44,6 +46,7 @@ def main(
     out="features.npy",
     batch_size=16,
     num_workers=8,
+    preserve=False,
 ):
     # Stick to DINO
     model_name = "vit_small_patch14_reg4_dinov2.lvd142m"
@@ -111,7 +114,29 @@ def main(
     feats = np.fromfile(tmppath, dtype=np.float32).reshape(-1, D)
     np.save(out, feats)
     os.remove(tmppath)
+    # update references with feature indices
+    if not preserve:  # don't preserve the original csv, add to it
+        df = pd.read_csv(refs)
+        df["feat_idx"] = [i for i in range(len(all_paths))]
+        df.to_csv(refs, index=False)
+
+
+def convert_to_csv(
+    refs="instance_references_EXAMPLE.txt",
+    out="refs.csv",
+):
+    with open(refs, "r") as f:
+        lines = f.readlines()
+    lines = [line.strip() for line in lines if line.strip()]
+    df = {
+        "filename": lines,
+        "bbox": [""] * len(lines),
+        "annotation": [""] * len(lines),
+        "feat_idx": [""] * len(lines),
+    }
+    pd.DataFrame(df).to_csv(out, index=False)
 
 
 if __name__ == "__main__":
-    fire.Fire(main)
+    funcs = {"main": main, "csv": convert_to_csv}
+    fire.Fire(funcs)
