@@ -18,15 +18,24 @@ import base64
 from concurrent.futures import ThreadPoolExecutor
 import matplotlib.pyplot as plt
 from io import BytesIO
+from typing import Dict, Any
+import pandas as pd
+
+
+# Add this custom exception after the imports
+class DataValidationError(Exception):
+    """Custom exception for data validation errors"""
+
+    pass
 
 
 # Configuration - hardcoded values (no environment variables)
 class Config:
     # Data paths
-    REFS_FILE = "instance_references_EXAMPLE.txt"
+    SAMPLES_FILE = "refs.csv"
     FEATURES_FILE = "features.npy"
-    ANNOTATIONS_FILE = "annotations.csv"
     MODEL_CHECKPOINT = "model_checkpoint.pt"
+    STRICT_MODE = True  # Enable strict validation mode
 
     # Class configuration
     CLASS_NAMES = ["Positive", "Negative", "Other", "Bad Quality"]
@@ -81,41 +90,258 @@ logger = setup_logging("INFO", "logs/app.log")
 executor = ThreadPoolExecutor(max_workers=Config.THREAD_POOL_SIZE)
 
 
+def parse_bbox(bbox_str: str) -> list:
+    """Parse bbox string into a list of integers"""
+    return [int(x) for x in bbox_str.split("-")]
+
+
+class DataValidator:
+    def _validate_features_file(self) -> np.ndarray:
+        """Load and validate the features file. Must be 2D and have enough rows for all feat_idx in CSV."""
+        try:
+            features = np.load(self.features_path)
+        except Exception as e:
+            raise DataValidationError(f"Could not load features file: {e}")
+        if features.ndim != 2:
+            raise DataValidationError(f"Features file must be a 2D matrix, got shape {features.shape}")
+        # Check that the file has enough rows for all feat_idx in the CSV
+        try:
+            df = pd.read_csv(self.csv_path)
+            if 'feat_idx' not in df.columns:
+                raise DataValidationError("CSV missing 'feat_idx' column for feature index validation")
+            max_idx = pd.to_numeric(df['feat_idx'], errors='coerce').max()
+            if np.isnan(max_idx):
+                raise DataValidationError("No valid feat_idx values found in CSV for feature index validation")
+            if features.shape[0] < max_idx + 1:
+                raise DataValidationError(f"Features file has {features.shape[0]} rows, but max feat_idx in CSV is {max_idx}")
+        except Exception as e:
+            raise DataValidationError(f"Error validating features file against CSV: {e}")
+        return features
+    def _validate_annotation_class(self, df: pd.DataFrame):
+        """Check that annotation column is either empty (missing in CSV) or a valid class name from Config.CLASS_NAMES. Only empty (not space, 'null', 'None') is allowed for missing."""
+        valid_classes = set(Config.CLASS_NAMES)
+        invalid = []
+        for idx, val in df["annotation"].items():
+            # Only allow empty string (not space, not None, not 'null', not 'None')
+            if (val == "") or (isinstance(val, float) and np.isnan(val)):
+                continue  # allow empty (missing in CSV)
+            if not (isinstance(val, str) and val in valid_classes):
+                invalid.append((idx, val))
+        if invalid:
+            self.errors.append(f"Invalid annotation class names at rows: {invalid}")
+
+    """Comprehensive validator for CSV + features file data structure"""
+
+    def __init__(self, csv_path: str, features_path: str, strict_mode: bool = True):
+        self.csv_path = Path(csv_path)
+        self.features_path = Path(features_path)
+        self.strict_mode = strict_mode
+        self.errors = []
+        self.warnings = []
+
+    def validate_all(self) -> Dict[str, Any]:
+        """Run simplified validation checks and return report"""
+        try:
+            # 1. File existence checks
+            self._check_file_existence()
+
+            # 2. Load and validate CSV structure
+            df = self._validate_csv_structure()
+
+            # 3. Load and validate features file
+            features = self._validate_features_file()
+
+            # 4. Check for every row: filename and feat_idx
+            self._validate_row_presence(df)
+
+            # 5. Check for duplicate filenames and feat_idx
+            self._validate_duplicates(df)
+
+            # 6. Check that all feat_idx exist in features
+            self._validate_feat_idx_range(df, features)
+
+            # 7. Check bbox format (now only empty cell or valid format)
+            self._validate_bbox_format(df)
+
+            # 8. Check annotation is valid class name or empty
+            self._validate_annotation_class(df)
+
+            # 9. Check all images exist
+            self._validate_image_files_exist(df)
+
+            return {
+                "valid": len(self.errors) == 0,
+                "errors": self.errors,
+                "warnings": self.warnings,
+                "dataframe": df,
+                "features": features,
+            }
+        except Exception as e:
+            self.errors.append(f"Critical validation error: {str(e)}")
+            return {
+                "valid": False,
+                "errors": self.errors,
+                "warnings": self.warnings,
+                "dataframe": None,
+                "features": None,
+            }
+
+    def _check_file_existence(self):
+        """Check if required files exist"""
+        if not self.csv_path.exists():
+            raise DataValidationError(f"CSV file not found: {self.csv_path}")
+
+        if not self.features_path.exists():
+            raise DataValidationError(f"Features file not found: {self.features_path}")
+
+        # Check file permissions
+        if not self.csv_path.is_file():
+            raise DataValidationError(f"CSV path is not a file: {self.csv_path}")
+
+        if not self.features_path.is_file():
+            raise DataValidationError(
+                f"Features path is not a file: {self.features_path}"
+            )
+
+    def _validate_csv_structure(self) -> pd.DataFrame:
+        """Validate CSV file structure and required columns"""
+        try:
+            df = pd.read_csv(self.csv_path)
+        except pd.errors.EmptyDataError:
+            raise DataValidationError("CSV file is empty")
+        except pd.errors.ParserError as e:
+            raise DataValidationError(f"CSV parsing error: {str(e)}")
+
+        required_cols = ["filename", "bbox", "annotation", "feat_idx"]
+        missing_cols = [col for col in required_cols if col not in df.columns]
+        if missing_cols:
+            raise DataValidationError(f"Missing required columns: {missing_cols}")
+
+        if len(df) == 0:
+            raise DataValidationError("CSV file contains no data rows")
+
+        return df
+
+    def _validate_row_presence(self, df: pd.DataFrame):
+        """Check that every row has a filename and feat_idx, and that bbox/annotation are either empty (missing in CSV) or valid."""
+        # Check filename
+        missing_filename = df["filename"].isna() | (df["filename"] == "")
+        if missing_filename.any():
+            self.errors.append(f"Rows with missing filename: {missing_filename.sum()}")
+
+        # Check feat_idx
+        missing_feat_idx = df["feat_idx"].isna()
+        if missing_feat_idx.any():
+            self.errors.append(f"Rows with missing feat_idx: {missing_feat_idx.sum()}")
+
+    def _validate_duplicates(self, df: pd.DataFrame):
+        """Check for duplicate filenames and feat_idx"""
+        dup_files = df["filename"].duplicated(keep=False)
+        if dup_files.any():
+            self.errors.append(
+                f"Duplicate filenames found: {df.loc[dup_files, 'filename'].unique().tolist()}"
+            )
+
+        dup_feat_idx = df["feat_idx"].duplicated(keep=False)
+        if dup_feat_idx.any():
+            self.errors.append(
+                f"Duplicate feat_idx found: {df.loc[dup_feat_idx, 'feat_idx'].unique().tolist()}"
+            )
+
+    def _validate_feat_idx_range(self, df: pd.DataFrame, features: np.ndarray):
+        """Check that all feat_idx exist in features (within range)"""
+        feat_idx = pd.to_numeric(df["feat_idx"], errors="coerce")
+        if feat_idx.isna().any():
+            self.errors.append("Non-numeric feat_idx values found.")
+            return
+        min_idx = feat_idx.min()
+        max_idx = feat_idx.max()
+        n_samples = features.shape[0]
+        if min_idx < 0 or max_idx >= n_samples:
+            self.errors.append(
+                f"feat_idx values out of range: min={min_idx}, max={max_idx}, features rows={n_samples}"
+            )
+
+    def _validate_bbox_format(self, df: pd.DataFrame):
+        """Check bbox format: 'top_row-left_col-bottom_row-right_col' or empty cell (missing in CSV). Only empty (not space, 'null', 'None') is allowed for missing."""
+        import re
+
+        bbox_pattern = re.compile(
+            r"^\s*-?\d+(?:\.\d+)?-\s*-?\d+(?:\.\d+)?-\s*-?\d+(?:\.\d+)?-\s*-?\d+(?:\.\d+)?\s*$"
+        )
+        for idx, bbox in df["bbox"].items():
+            # Only allow empty string (not space, not None, not 'null', not 'None')
+            if (bbox == "") or (isinstance(bbox, float) and np.isnan(bbox)):
+                continue  # allow empty (missing in CSV)
+            if not (isinstance(bbox, str) and bbox_pattern.match(bbox)):
+                self.errors.append(f"Row {idx}: bbox format invalid ('{bbox}')")
+
+    def _validate_image_files_exist(self, df: pd.DataFrame):
+        """Check that all image files exist"""
+        missing = []
+        for idx, filename in df["filename"].items():
+            if pd.isna(filename) or filename == "":
+                continue
+            if not Path(filename).exists():
+                missing.append(filename)
+        if missing:
+            self.errors.append(f"Missing image files: {missing}")
+
+
+    # print_validation_report removed for assertion-based validation
+
+
+# Add this convenience function after the DataValidator class
+def validate_dataset(
+    csv_path: str, features_path: str, strict_mode: bool = True
+) -> Dict[str, Any]:
+    """Convenience function to validate a dataset"""
+    validator = DataValidator(csv_path, features_path, strict_mode)
+    result = validator.validate_all()
+    assert result["valid"], f"Dataset validation failed: {result['errors']}"
+    return result
+
+
 class DataManager:
-    def __init__(self, refs_file):
+
+    def __init__(self):
         logger.info("Loading features and references...")
-        self.samples = []
-        with open(refs_file, "r") as f:
-            for line in f:
-                parts = line.strip().split()
-                if not parts:
-                    continue
-                img_path = parts[0]
-                bbox = list(map(int, parts[1:5])) if len(parts) == 5 else None
-                self.samples.append({"img_path": img_path, "bbox": bbox})
+        df = pd.read_csv(Config.SAMPLES_FILE)
+        self.samples = df.to_dict(orient="records")
         self.feats = np.load(Config.FEATURES_FILE)
         self.N = len(self.samples)
-        assert self.N == self.feats.shape[0]
+        assert max(s["feat_idx"] for s in self.samples) + 1 <= self.feats.shape[0]
         self.labeled_indices = set()
         self.unlabeled_indices = set(range(self.N))
         # Add image caching
         self.image_cache = {}
+        logger.info(f"Loaded {self.N} samples with {self.feats.shape[1]} features")
 
     def get_features(self, idx):
-        return self.feats[idx]
+        feat_idx = self.samples[idx]["feat_idx"]
+        return self.feats[feat_idx]
 
     def get_image(self, idx, center_crop=False):
+        if idx >= self.N:
+            raise IndexError(f"Sample index {idx} out of range (max: {self.N-1})")
+
         cache_key = f"{idx}_{center_crop}"
         if cache_key in self.image_cache:
             return self.image_cache[cache_key]
 
         try:
             sample = self.samples[idx]
-            img = Image.open(sample["img_path"]).convert("RGB")
-            bbox = sample["bbox"]
+            img = Image.open(sample["filename"]).convert("RGB")
+            bbox_str = sample.get("bbox", "")
+            bbox = None
+            if isinstance(bbox_str, str) and bbox_str.strip() != "":
+                try:
+                    bbox = parse_bbox(bbox_str)
+                except Exception:
+                    bbox = None
 
             # Draw bounding box if available
-            if bbox:
+            if bbox and len(bbox) == 4:
                 draw = ImageDraw.Draw(img)
                 r1, c1, r2, c2 = bbox
                 draw.rectangle([c1, r1, c2, r2], outline="green", width=3)
@@ -142,7 +368,6 @@ class DataManager:
                 # Remove oldest entry (FIFO)
                 self.image_cache.pop(next(iter(self.image_cache)))
             self.image_cache[cache_key] = img
-
             return img
         except Exception as e:
             logger.error(f"Error loading image {idx}: {e}")
@@ -270,38 +495,27 @@ class IncrementalModel:
 
 
 class Orchestrator:
-    def __init__(
-        self,
-        refs_file,
-        annotation_file,
-        score_interval,
-        retrain_interval,
-        n_iter,
-        scoring_method,
-        use_ckpt,
-    ):
-        self.scoring_method = scoring_method
-        self.data_mgr = DataManager(refs_file)
+    def __init__(self):
+        self.scoring_method = Config.SCORING_METHOD
+        self.data_mgr = DataManager()
 
         # Validate configuration
-        score_interval = score_interval
         assert (
-            self.data_mgr.N > score_interval
-        ), f"Not enough samples ({self.data_mgr.N}), need at least {score_interval} to run active learning, annotate in a txt yourself."
+            self.data_mgr.N > Config.SCORE_INTERVAL
+        ), f"Not enough samples ({self.data_mgr.N}), need at least {Config.SCORE_INTERVAL} to run active learning, annotate in a txt yourself."
 
         self.model = IncrementalModel(
             n_features=self.data_mgr.feats.shape[1],
-            n_iter=n_iter,
-            use_ckpt=use_ckpt,
+            n_iter=Config.MODEL_N_ITER,
+            use_ckpt=Config.MODEL_CHECKPOINT is not None,
         )
-        self.use_ckpt = use_ckpt
-        self.annotation_file = Path(annotation_file)
+        self.use_ckpt = Config.MODEL_CHECKPOINT is not None
         self.annotations = []  # list of (idx, label)
         self.current_sample = None
         self.previous_samples = []
         self.class_counts = [0] * len(Config.CLASS_NAMES)
-        self.score_interval = score_interval
-        self.retrain_interval = retrain_interval
+        self.score_interval = Config.SCORE_INTERVAL
+        self.retrain_interval = Config.RETRAIN_INTERVAL
         self.brier_history = []
         self.is_correct_history = []
         self.current_prediction = None
@@ -322,12 +536,12 @@ class Orchestrator:
 
         # Initialize candidates
         self.candidates = np.random.choice(
-            self.data_mgr.N, score_interval, replace=False
+            self.data_mgr.N, Config.SCORE_INTERVAL, replace=False
         ).tolist()
         self.current_sample = self.candidates.pop(0)
         self.next_sample = None
-        if self.annotation_file.exists():
-            self._load_annotations_and_retrain()
+        # Load existing annotations from samples file
+        self._load_annotations_from_samples()
         self._ensure_next_sample()
 
     def get_error_chart(self):
@@ -403,21 +617,15 @@ class Orchestrator:
             logger.error(f"Error generating chart: {e}")
             return None
 
-    def _load_annotations_and_retrain(self):
+    def _load_annotations_from_samples(self):
         loaded = []
         self.class_counts = [0] * len(Config.CLASS_NAMES)
-        with open(self.annotation_file, "r") as f:
-            reader = csv.reader(f)
-            for row in reader:
-                try:
-                    idx, label = int(row[0]), int(row[1])
-                    loaded.append((idx, label))
-                    # Update counters
-                    self.class_counts[label] += 1
-                except (ValueError, IndexError) as e:
-                    logger.warning(f"Error loading annotation row: {e}")
-
-        # Use more iterations for initial training if there are enough annotations
+        for idx, sample in enumerate(self.data_mgr.samples):
+            class_name = sample.get("annotation", "")
+            if isinstance(class_name, str) and class_name.strip() != "" and class_name in Config.CLASS_NAMES:
+                label = Config.CLASS_NAMES.index(class_name)
+                loaded.append((idx, label))
+                self.class_counts[label] += 1
         if len(loaded) > 10:
             old_n_iter = self.model.n_iter
             self.model.n_iter = 100  # Increase iterations for initial training
@@ -477,14 +685,12 @@ class Orchestrator:
                     f"Brier score for sample {idx}: {brier:.4f}, {'right' if is_correct else 'wrong'} prediction"
                 )
 
-            # Save annotation
+            # Save annotation in samples file (update in-memory and write to CSV)
             sample = self.data_mgr.samples[idx]
-            with open(self.annotation_file, "a", newline="") as f:
-                writer = csv.writer(f)
-                row = [idx, label, sample["img_path"]]
-                if sample.get("bbox"):
-                    row.extend(sample["bbox"])
-                writer.writerow(row)
+            class_name = Config.CLASS_NAMES[label]
+            sample["annotation"] = class_name
+            # Write all samples back to the samples file
+            pd.DataFrame(self.data_mgr.samples).to_csv(Config.SAMPLES_FILE, index=False)
 
             # Update internal state
             self.class_counts[label] += 1
@@ -659,13 +865,9 @@ class Orchestrator:
             self.brier_history.pop()
             self.is_correct_history.pop()
 
-        with open(self.annotation_file, "w", newline="") as f:
-            writer = csv.writer(f)
-            for aidx, albl in self.annotations:
-                writer.writerow(
-                    [aidx, albl, self.data_mgr.samples[aidx]["img_path"]]
-                    + list(self.data_mgr.samples[aidx].get("bbox", []))
-                )
+        # Save all annotations to samples file (overwrite CSV)
+        import pandas as pd
+        pd.DataFrame(self.data_mgr.samples).to_csv(Config.SAMPLES_FILE, index=False)
 
         self.data_mgr.unmark_labeled(idx)
         self.retrain(self.annotations)
@@ -678,17 +880,13 @@ class Orchestrator:
         return self.current_prediction
 
 
+validate_dataset(
+    Config.SAMPLES_FILE, Config.FEATURES_FILE, strict_mode=Config.STRICT_MODE
+)
+
 # Initialize with configuration
 logger.info("Starting the orchestrator...")
-orchestrator = Orchestrator(
-    refs_file=Config.REFS_FILE,
-    annotation_file=Config.ANNOTATIONS_FILE,
-    score_interval=Config.SCORE_INTERVAL,
-    retrain_interval=Config.RETRAIN_INTERVAL,
-    n_iter=Config.MODEL_N_ITER,
-    scoring_method=Config.SCORING_METHOD,
-    use_ckpt=Config.MODEL_CHECKPOINT is not None,
-)
+orchestrator = Orchestrator()
 
 
 async def homepage(request):
@@ -747,16 +945,19 @@ async def homepage(request):
 
     # ——— new: fetch bbox & path for display ———
     sample = orchestrator.data_mgr.samples[idx]
-    img_path = sample["img_path"]
-    bbox = sample["bbox"]  # [imgnum, row, col, h, w]
+    img_path = sample["filename"]
+    bbox_str = sample.get("bbox", "")
     path_html = f"<p><strong>Image file:</strong> {img_path}</p>"
     bbox_html = ""
-    if bbox:
-        r, c, h, w = bbox
-        bbox_html = (
-            f"<p><strong>Bounding‐box:</strong> row={r}, col={c}, "
-            f"height={h}, width={w}</p>"
-        )
+    if isinstance(bbox_str, str) and bbox_str.strip() != "":
+        try:
+            r, c, h, w = parse_bbox(bbox_str)
+            bbox_html = (
+                f"<p><strong>Bounding‐box:</strong> row={r}, col={c}, "
+                f"height={h}, width={w}</p>"
+            )
+        except Exception:
+            bbox_html = f"<p><strong>Bounding‐box:</strong> Invalid format</p>"
     # ————————————————————————————————
 
     img = orchestrator.data_mgr.get_image(idx, center_crop=True)
@@ -1048,3 +1249,8 @@ app = Starlette(
 
 # to expose to the network
 # uvicorn app:app --host 0.0.0.0 --port 2333
+
+# the data should be a csv with columns:
+# - filename: path to the image file
+# - bbox: optional bounding box in the format "row,col,height,width"
+# - annotation: optional class name for the image
