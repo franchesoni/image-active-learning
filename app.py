@@ -103,20 +103,31 @@ class DataValidator:
         except Exception as e:
             raise DataValidationError(f"Could not load features file: {e}")
         if features.ndim != 2:
-            raise DataValidationError(f"Features file must be a 2D matrix, got shape {features.shape}")
+            raise DataValidationError(
+                f"Features file must be a 2D matrix, got shape {features.shape}"
+            )
         # Check that the file has enough rows for all feat_idx in the CSV
         try:
             df = pd.read_csv(self.csv_path)
-            if 'feat_idx' not in df.columns:
-                raise DataValidationError("CSV missing 'feat_idx' column for feature index validation")
-            max_idx = pd.to_numeric(df['feat_idx'], errors='coerce').max()
+            if "feat_idx" not in df.columns:
+                raise DataValidationError(
+                    "CSV missing 'feat_idx' column for feature index validation"
+                )
+            max_idx = pd.to_numeric(df["feat_idx"], errors="coerce").max()
             if np.isnan(max_idx):
-                raise DataValidationError("No valid feat_idx values found in CSV for feature index validation")
+                raise DataValidationError(
+                    "No valid feat_idx values found in CSV for feature index validation"
+                )
             if features.shape[0] < max_idx + 1:
-                raise DataValidationError(f"Features file has {features.shape[0]} rows, but max feat_idx in CSV is {max_idx}")
+                raise DataValidationError(
+                    f"Features file has {features.shape[0]} rows, but max feat_idx in CSV is {max_idx}"
+                )
         except Exception as e:
-            raise DataValidationError(f"Error validating features file against CSV: {e}")
+            raise DataValidationError(
+                f"Error validating features file against CSV: {e}"
+            )
         return features
+
     def _validate_annotation_class(self, df: pd.DataFrame):
         """Check that annotation column is either empty (missing in CSV) or a valid class name from Config.CLASS_NAMES. Only empty (not space, 'null', 'None') is allowed for missing."""
         valid_classes = set(Config.CLASS_NAMES)
@@ -286,7 +297,6 @@ class DataValidator:
                 missing.append(filename)
         if missing:
             self.errors.append(f"Missing image files: {missing}")
-
 
     # print_validation_report removed for assertion-based validation
 
@@ -622,7 +632,11 @@ class Orchestrator:
         self.class_counts = [0] * len(Config.CLASS_NAMES)
         for idx, sample in enumerate(self.data_mgr.samples):
             class_name = sample.get("annotation", "")
-            if isinstance(class_name, str) and class_name.strip() != "" and class_name in Config.CLASS_NAMES:
+            if (
+                isinstance(class_name, str)
+                and class_name.strip() != ""
+                and class_name in Config.CLASS_NAMES
+            ):
                 label = Config.CLASS_NAMES.index(class_name)
                 loaded.append((idx, label))
                 self.class_counts[label] += 1
@@ -867,6 +881,7 @@ class Orchestrator:
 
         # Save all annotations to samples file (overwrite CSV)
         import pandas as pd
+
         pd.DataFrame(self.data_mgr.samples).to_csv(Config.SAMPLES_FILE, index=False)
 
         self.data_mgr.unmark_labeled(idx)
@@ -1015,27 +1030,24 @@ async def homepage(request):
             f"{cname} ({i+1})</button>"
         )
 
-    script = """
+    script = f"""
     <script>
     // Prevent multiple rapid submissions
     let processingSubmission = false;
     let lastKeyTime = 0;
     const THROTTLE_TIME = 500; // ms
 
-    document.addEventListener('keydown', function(event) {
+    document.addEventListener('keydown', function(event) {{
         const now = Date.now();
-        
         // Skip if we're already processing or if keys are coming too fast
-        if (processingSubmission || (now - lastKeyTime < THROTTLE_TIME)) {
+        if (processingSubmission || (now - lastKeyTime < THROTTLE_TIME)) {{
             event.preventDefault();
             return;
-        }
-        
+        }}
         lastKeyTime = now;
-        
         // Multi-class: 1,2,3,4 keys for classes
         let keyToClass = {{
-            {",".join([
+            {','.join([
                 f"'{{n}}': {i},'Digit{{n}}': {i},'Numpad{{n}}': {i}"
                 .format(n=i+1, i=i)
                 for i in range(len(Config.CLASS_NAMES))
@@ -1044,7 +1056,6 @@ async def homepage(request):
         if (event.code in keyToClass) {{
             submitLabel(keyToClass[event.code], 'classButton'+keyToClass[event.code]);
         }}
-
         // Backspace: revert
         if (event.code === 'Backspace') {{
             event.preventDefault();
@@ -1053,7 +1064,6 @@ async def homepage(request):
                 window.location.href = '/revert';
             }}
         }}
-
         // Help modal
         if (event.code === 'KeyH' || event.key === '?') {{
             toggleHelp(true);
@@ -1061,35 +1071,30 @@ async def homepage(request):
         if (event.code === 'Escape') {{
             toggleHelp(false);
         }}
-
-        function submitLabel(value, buttonId) {
+        function submitLabel(value, buttonId) {{
             processingSubmission = true;
             document.getElementById(buttonId).classList.add('active');
             document.getElementById('labelValue').value = value;
             document.getElementById('labelForm').submit();
-        }
-        
-        function toggleHelp(show) {
+        }}
+        function toggleHelp(show) {{
             document.getElementById('helpModal').style.display = show ? 'block' : 'none';
-        }
-    });
-
+        }}
+    }});
     // Reset the processing flag when the page has completely loaded
-    window.addEventListener('load', function() {
-    processingSubmission = false;
-    });
-
-    document.addEventListener('DOMContentLoaded', function() {
-    document.getElementById('labelForm').addEventListener('submit', function() {
-        {"".join([f"document.getElementById('classButton{i}').disabled = true;" for i in range(len(Config.CLASS_NAMES))])}
-        
-        // Show visual feedback
-        document.body.style.opacity = '0.7';
-        document.body.insertAdjacentHTML('beforeend', 
-        '<div id="loading" style="position:fixed;top:0;left:0;width:100%;height:100%;display:flex;justify-content:center;align-items:center;background:rgba(255,255,255,0.5);z-index:1000;">' +
-        '<div style="padding:20px;background:white;border-radius:5px;box-shadow:0 0 10px rgba(0,0,0,0.2);">Processing...</div></div>');
-    });
-    });
+    window.addEventListener('load', function() {{
+        processingSubmission = false;
+    }});
+    document.addEventListener('DOMContentLoaded', function() {{
+        document.getElementById('labelForm').addEventListener('submit', function() {{
+            {''.join([f"document.getElementById('classButton{i}').disabled = true;" for i in range(len(Config.CLASS_NAMES))])}
+            // Show visual feedback
+            document.body.style.opacity = '0.7';
+            document.body.insertAdjacentHTML('beforeend', 
+            '<div id="loading" style="position:fixed;top:0;left:0;width:100%;height:100%;display:flex;justify-content:center;align-items:center;background:rgba(255,255,255,0.5);z-index:1000;">' +
+            '<div style="padding:20px;background:white;border-radius:5px;box-shadow:0 0 10px rgba(0,0,0,0.2);">Processing...</div></div>');
+        }});
+    }});
     </script>
     """
 
