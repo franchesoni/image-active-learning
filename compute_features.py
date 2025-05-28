@@ -122,10 +122,10 @@ def main(
 
 
 def convert_to_csv(
-    refs="instance_references_EXAMPLE.txt",
+    path_to_filenames,
     out="refs.csv",
 ):
-    with open(refs, "r") as f:
+    with open(path_to_filenames, "r") as f:
         lines = f.readlines()
     lines = [line.strip() for line in lines if line.strip()]
     df = {
