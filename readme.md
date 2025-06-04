@@ -4,10 +4,11 @@ A fast, efficient tool for annotating images with labels using active learning t
 
 ## Requirements
 
-**What you need to try it:**
+**What you need to use it:**
 - a `.csv` file with columns `filename`, `bbox`, `annotation`, and `feat_idx`
 - a `.npy` file with a feature vector associated to each image
 - a prepared environment
+- set your configuration in `app.py`
 
 ### Need help getting those ready?
 **Environment:**
